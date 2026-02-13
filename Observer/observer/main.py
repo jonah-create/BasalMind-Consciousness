@@ -39,11 +39,14 @@ from observer.adapters.slack_adapter import (
 from observer.storage.redis_cache import RedisCache
 from observer.metrics import ObserverMetrics
 from observer.nats_publisher import NATSPublisher
-from observer.timescale_writer import TimescaleWriter
+from observer.timescale_writer_enhanced import EnhancedTimescaleWriter
+import redis.asyncio as redis_async
 
 # Import new Observer modules
 from observer.circular_protection import CircularReferenceProtector
 from observer.neo4j_reader import ObserverNeo4jReader, EventTypeQuery
+from observer.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+from observer.event_correlator import EventCorrelator
 
 # Configure logging
 logging.basicConfig(
@@ -61,20 +64,23 @@ app = FastAPI(
 
 # Global state (initialized on startup)
 redis_cache: RedisCache = None
+redis_async_client: Optional[redis_async.Redis] = None
 metrics: ObserverMetrics = None
 nats_publisher: Optional[NATSPublisher] = None
-timescale_writer: Optional[TimescaleWriter] = None
+timescale_writer: Optional[EnhancedTimescaleWriter] = None
 neo4j_reader: Optional[ObserverNeo4jReader] = None
+neo4j_circuit_breaker: Optional[CircuitBreaker] = None
+event_correlator: Optional[EventCorrelator] = None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize Observer components on startup."""
-    global redis_cache, metrics, nats_publisher, timescale_writer, neo4j_reader
+    global redis_cache, redis_async_client, metrics, nats_publisher, timescale_writer, neo4j_reader, neo4j_circuit_breaker, event_correlator
 
     logger.info("🚀 Starting Observer service (6-stage pipeline)...")
 
-    # Initialize Redis cache
+    # Initialize Redis cache (synchronous for dedup)
     redis_cache = RedisCache(
         host=os.getenv("REDIS_HOST", "localhost"),
         port=int(os.getenv("REDIS_PORT", 6390)),
@@ -82,27 +88,54 @@ async def startup_event():
         db=int(os.getenv("REDIS_DB", 0))
     )
 
+    # Initialize async Redis client (for WAL)
+    redis_async_client = redis_async.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6390)),
+        password=os.getenv("REDIS_PASSWORD"),
+        db=int(os.getenv("REDIS_DB", 0)),
+        decode_responses=False  # WAL needs binary mode for msgpack
+    )
+
     # Initialize metrics
     metrics = ObserverMetrics()
 
-    # Initialize Neo4j reader (for enrichment stage)
+    # Initialize Neo4j reader with circuit breaker (for enrichment stage)
     try:
         neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         neo4j_password = os.getenv("NEO4J_PASSWORD")
-        
+
         if neo4j_password:
+            # Create circuit breaker for Neo4j
+            neo4j_circuit_breaker = CircuitBreaker(
+                name="neo4j",
+                failure_threshold=5,
+                recovery_timeout=60,
+                expected_exception=Exception
+            )
+
             neo4j_reader = ObserverNeo4jReader(neo4j_uri=neo4j_uri,
                 neo4j_user=neo4j_user,
                 neo4j_password=neo4j_password
             )
-            logger.info(f"✅ Neo4j reader connected: {neo4j_uri}")
+            logger.info(f"✅ Neo4j reader connected: {neo4j_uri} (with circuit breaker)")
+
+            # Initialize event correlator (uses same Neo4j connection)
+            event_correlator = EventCorrelator(
+                neo4j_uri=neo4j_uri,
+                neo4j_user=neo4j_user,
+                neo4j_password=neo4j_password
+            )
+            logger.info(f"✅ Event correlator initialized")
         else:
-            logger.warning("⚠️ Neo4j credentials missing, skipping enrichment")
+            logger.warning("⚠️ Neo4j credentials missing, skipping enrichment and correlation")
             neo4j_reader = None
+            event_correlator = None
     except Exception as e:
         logger.warning(f"⚠️ Neo4j connection failed (non-fatal): {e}")
         neo4j_reader = None
+        event_correlator = None
 
     # Initialize NATS publisher
     try:
@@ -116,23 +149,28 @@ async def startup_event():
         logger.warning(f"⚠️ NATS connection failed (non-fatal): {e}")
         nats_publisher = None
 
-    # Initialize TimescaleDB writer
+    # Initialize Enhanced TimescaleDB writer (with batch processing, WAL, backpressure)
     try:
         host = os.getenv("TIMESCALE_HOST", "localhost")
         port = int(os.getenv("TIMESCALE_PORT", 5432))
         database = os.getenv("TIMESCALE_DB", "basalmind_events")
         user = os.getenv("TIMESCALE_USER", "basalmind")
         password = os.getenv("TIMESCALE_PASSWORD", "basalmind_secure_2024")
+        batch_size = int(os.getenv("BATCH_SIZE", 100))
+        flush_interval = float(os.getenv("FLUSH_INTERVAL", 1.0))
 
-        timescale_writer = TimescaleWriter(
+        timescale_writer = EnhancedTimescaleWriter(
             host=host,
             port=port,
             database=database,
             user=user,
-            password=password
+            password=password,
+            redis_client=redis_async_client,
+            batch_size=batch_size,
+            flush_interval=flush_interval
         )
         await timescale_writer.connect()
-        logger.info(f"✅ TimescaleDB connected: {host}:{port}/{database}")
+        logger.info(f"✅ TimescaleDB connected: {host}:{port}/{database} (Enhanced with WAL & batching)")
     except Exception as e:
         logger.error(f"❌ TimescaleDB connection failed (CRITICAL): {e}")
         timescale_writer = None
@@ -153,7 +191,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
-    global nats_publisher, neo4j_reader
+    global nats_publisher, neo4j_reader, event_correlator
 
     logger.info("🛑 Shutting down Observer...")
 
@@ -165,6 +203,9 @@ async def shutdown_event():
 
     if neo4j_reader:
         neo4j_reader.close()
+
+    if event_correlator:
+        event_correlator.close()
 
     logger.info("✅ Observer shutdown complete")
 
@@ -233,49 +274,75 @@ async def process_event_pipeline(canonical_event: Dict[str, Any]) -> Dict[str, A
     
     logger.info(f"[STAGE 3 - LOOP CHECK] Event passed circular reference check")
     
-    # STAGE 4: ENRICHMENT (Neo4j Dimensional Context)
+    # STAGE 4: ENRICHMENT (Neo4j Dimensional Context with Circuit Breaker)
     enriched_event = canonical_event.copy()
-    
-    if neo4j_reader:
+
+    if neo4j_reader and neo4j_circuit_breaker:
         try:
-            # Query Neo4j for event type metadata
-            event_type_name = canonical_event["event_type"]
-            source_system = canonical_event["source_system"]
-            
-            # Check if event should be processed based on Neo4j filters
-            should_process_neo4j, neo4j_reason = neo4j_reader.should_process_event(
-                event_type_name,
-                originated_from="Observer"
-            )
-            
-            if not should_process_neo4j:
-                logger.warning(f"[STAGE 4 - ENRICHMENT] Neo4j filter rejected: {neo4j_reason}")
-                return {
-                    "status": "rejected",
-                    "event_id": canonical_event.get("event_id"),
-                    "stage_reached": 4,
-                    "reason": neo4j_reason
-                }
-            
-            # Get dimensional context (simplified for Observer)
-            event_meta = neo4j_reader.get_event_type_metadata(event_type_name)
-            
-            if event_meta:
-                enriched_event["_enrichment"] = {
-                    "priority": event_meta.get("priority"),
-                    "category": event_meta.get("category"),
-                    "retention_days": event_meta.get("retention_days"),
-                    "consumed_by": event_meta.get("consumed_by", [])
-                }
-                logger.info(f"[STAGE 4 - ENRICHMENT] Added dimensional context: priority={event_meta.get('priority')}")
-            else:
-                logger.debug(f"[STAGE 4 - ENRICHMENT] No metadata found for {event_type_name}")
+            # Use circuit breaker to protect against Neo4j failures
+            async with neo4j_circuit_breaker:
+                # Query Neo4j for event type metadata
+                event_type_name = canonical_event["event_type"]
+                source_system = canonical_event["source_system"]
+
+                # Check if event should be processed based on Neo4j filters
+                should_process_neo4j, neo4j_reason = neo4j_reader.should_process_event(
+                    event_type_name,
+                    originated_from="Observer"
+                )
+
+                if not should_process_neo4j:
+                    logger.warning(f"[STAGE 4 - ENRICHMENT] Neo4j filter rejected: {neo4j_reason}")
+                    return {
+                        "status": "rejected",
+                        "event_id": canonical_event.get("event_id"),
+                        "stage_reached": 4,
+                        "reason": neo4j_reason
+                    }
+
+                # Get dimensional context (simplified for Observer)
+                event_meta = neo4j_reader.get_event_type_metadata(event_type_name)
+
+                if event_meta:
+                    enriched_event["_enrichment"] = {
+                        "priority": event_meta.get("priority"),
+                        "category": event_meta.get("category"),
+                        "retention_days": event_meta.get("retention_days"),
+                        "consumed_by": event_meta.get("consumed_by", [])
+                    }
+                    logger.info(f"[STAGE 4 - ENRICHMENT] Added dimensional context: priority={event_meta.get('priority')}")
+                else:
+                    logger.debug(f"[STAGE 4 - ENRICHMENT] No metadata found for {event_type_name}")
+
+        except CircuitBreakerOpen:
+            # Circuit breaker is open - skip enrichment but continue processing
+            logger.warning(f"[STAGE 4 - ENRICHMENT] Circuit breaker OPEN - skipping Neo4j enrichment")
+            enriched_event["_enrichment"] = {"circuit_breaker": "open", "enriched": False}
                 
         except Exception as e:
             logger.warning(f"[STAGE 4 - ENRICHMENT] Neo4j enrichment failed (non-fatal): {e}")
     else:
         logger.debug("[STAGE 4 - ENRICHMENT] Skipped (Neo4j not available)")
-    
+
+    # STAGE 4b: CORRELATION KEY ENRICHMENT
+    if event_correlator:
+        try:
+            correlation_metadata = event_correlator.enrich_event(enriched_event)
+            if correlation_metadata and correlation_metadata.get("correlatable"):
+                # Add correlation metadata to event
+                if "normalized" not in enriched_event:
+                    enriched_event["normalized"] = {}
+                if "metadata" not in enriched_event["normalized"]:
+                    enriched_event["normalized"]["metadata"] = {}
+
+                enriched_event["normalized"]["metadata"]["correlation"] = correlation_metadata
+                logger.info(
+                    f"[STAGE 4b - CORRELATION] Added {len(correlation_metadata.get('correlation_keys', {}))} "
+                    f"correlation keys: {list(correlation_metadata.get('correlation_keys', {}).keys())}"
+                )
+        except Exception as e:
+            logger.warning(f"[STAGE 4b - CORRELATION] Correlation enrichment failed (non-fatal): {e}")
+
     # STAGE 5: STORAGE (TimescaleDB - Permanent)
     if timescale_writer and timescale_writer.is_connected:
         try:
