@@ -63,7 +63,8 @@ class RedisCache:
             "type": event_data.get("event_type"),
             "user": event_data.get("user_id"),
             "timestamp": event_data.get("source_timestamp"),
-            "text": event_data.get("text", "")[:100]  # First 100 chars
+            "text": event_data.get("text", "")[:100],  # First 100 chars
+            "unique_id": event_data.get("metadata", {}).get("event_ts", "")  # Slack unique message ID
         }
         
         # Hash to create compact key

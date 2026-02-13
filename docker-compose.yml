@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # NATS with JetStream - Event Bus
+  nats:
+    image: nats:2.10-alpine
+    container_name: basalmind-nats
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # HTTP monitoring
+      - "6222:6222"  # Cluster routes
+    command:
+      - "--js"                    # Enable JetStream
+      - "--sd=/data"              # Store directory
+      - "--http_port=8222"        # Monitoring
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - basalmind-net
+
+  # Redis - Deduplication ONLY (5 min TTL)
+  redis:
+    image: redis:7-alpine
+    container_name: basalmind-redis
+    ports:
+      - "6390:6379"
+    command: redis-server --requirepass _t9iV2e(p9voC34HpkvxirRoy%8cSYcf
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "_t9iV2e(p9voC34HpkvxirRoy%8cSYcf", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - basalmind-net
+
+  # TimescaleDB - Permanent Audit Trail
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: basalmind-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: basalmind_events
+      POSTGRES_USER: basalmind
+      POSTGRES_PASSWORD: basalmind_secure_2024
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./Observer/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U basalmind -d basalmind_events"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - basalmind-net
+
+  # Observer - Sensory Layer
+  observer:
+    build:
+      context: /opt/basalmind/BasalMind_Consciousness
+      dockerfile: Observer/Dockerfile
+    container_name: basalmind-observer
+    ports:
+      - "5001:5001"
+    environment:
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: _t9iV2e(p9voC34HpkvxirRoy%8cSYcf
+      REDIS_DB: 0
+
+      # NATS
+      NATS_URL: nats://nats:4222
+      NATS_STREAM: BASALMIND_EVENTS
+
+      # TimescaleDB
+      TIMESCALE_HOST: timescaledb
+      TIMESCALE_PORT: 5432
+      TIMESCALE_DB: basalmind_events
+      TIMESCALE_USER: basalmind
+      TIMESCALE_PASSWORD: basalmind_secure_2024
+
+      # Observer
+      OBSERVER_HOST: 0.0.0.0
+      OBSERVER_PORT: 5001
+
+      # Logging
+      LOG_LEVEL: INFO
+      LOG_FILE: /var/log/observer/observer.log
+    volumes:
+      - observer-logs:/var/log/observer
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5001/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - basalmind-net
+
+volumes:
+  nats-data:
+  redis-data:
+  timescale-data:
+  observer-logs:
+
+networks:
+  basalmind-net:
+    driver: bridge

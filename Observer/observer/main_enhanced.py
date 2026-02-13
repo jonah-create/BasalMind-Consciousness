@@ -92,9 +92,10 @@ async def startup_event():
         neo4j_password = os.getenv("NEO4J_PASSWORD")
         
         if neo4j_password:
-            neo4j_reader = ObserverNeo4jReader(neo4j_uri=neo4j_uri,
-                neo4j_user=neo4j_user,
-                neo4j_password=neo4j_password
+            neo4j_reader = ObserverNeo4jReader(
+                uri=neo4j_uri,
+                user=neo4j_user,
+                password=neo4j_password
             )
             logger.info(f"✅ Neo4j reader connected: {neo4j_uri}")
         else:
@@ -257,10 +258,13 @@ async def process_event_pipeline(canonical_event: Dict[str, Any]) -> Dict[str, A
                     "reason": neo4j_reason
                 }
             
-            # Get dimensional context (simplified for Observer)
-            event_meta = neo4j_reader.get_event_type_metadata(event_type_name)
+            # Get dimensional context
+            event_types = neo4j_reader.get_event_types_by_dimensions(
+                EventTypeQuery(name=event_type_name)
+            )
             
-            if event_meta:
+            if event_types:
+                event_meta = event_types[0]
                 enriched_event["_enrichment"] = {
                     "priority": event_meta.get("priority"),
                     "category": event_meta.get("category"),
@@ -364,49 +368,6 @@ async def health():
             }
         }
     }
-
-
-
-@app.post("/observe/cloudflare/event")
-async def observe_cloudflare_event(request: Request):
-    """
-    Observe Cloudflare edge event.
-    This endpoint receives real-time HTTP request events from Cloudflare Workers.
-    """
-    try:
-        event_data = await request.json()
-        
-        # Validate required fields
-        if "event_type" not in event_data:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Missing required field: event_type"}
-            )
-        
-        # Ensure required structure
-        if "source_system" not in event_data:
-            event_data["source_system"] = "cloudflare"
-        
-        # Add event_id if not present
-        if "event_id" not in event_data:
-            import uuid
-            event_data["event_id"] = str(uuid.uuid4())
-        
-        # Add observed timestamp if not present
-        if "observed_at" not in event_data:
-            event_data["observed_at"] = datetime.utcnow().isoformat()
-        
-        # Process through pipeline
-        result = await process_event_pipeline(event_data)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing Cloudflare event: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
-
 
 
 @app.get("/metrics")
