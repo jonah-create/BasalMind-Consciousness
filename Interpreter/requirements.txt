@@ -1,4 +1,20 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-python-dotenv==1.0.0
-nats-py==2.6.0
+# Interpreter Module Requirements - Phase 1
+
+# Database Drivers
+asyncpg==0.29.0          # PostgreSQL async driver
+neo4j==5.15.0            # Neo4j Python driver
+pgvector==0.2.4          # PostgreSQL vector extension
+
+# OpenAI (for embeddings)
+openai==1.6.1
+
+# Utilities
+python-dotenv==1.0.0     # Environment management
+asyncio-mqtt==0.16.2     # MQTT (future use)
+
+# Logging and monitoring
+structlog==24.1.0        # Structured logging (optional)
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
