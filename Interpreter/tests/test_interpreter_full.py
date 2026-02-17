@@ -967,5 +967,307 @@ class TestGraphNodeIdsLinkage:
         assert result == []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread Neo4j Wiring (Priority: engine._create_graph_nodes with thread_data)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestThreadNeo4jWiring:
+    """
+    Verify that interpreter_Thread nodes are created in Neo4j when
+    thread_data is passed to _create_graph_nodes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_graph_nodes_creates_thread_node(self):
+        """Thread data passed to _create_graph_nodes must call create_thread_node."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+
+        mock_neo4j = MagicMock()
+        mock_neo4j.create_or_update_user.return_value = "U1"
+        mock_neo4j.create_intent_node.return_value = "intent_e1_asking_question"
+        mock_neo4j.create_thread_node.return_value = "T_thread1"
+        engine.neo4j_writer = mock_neo4j
+
+        thread_data = [{
+            "thread_id": "thread1",
+            "channel_id": "C1",
+            "topic": "deployment pipeline",
+            "phase": "discussion",
+            "started_at": datetime(2026, 2, 17, 10, 0, 0),
+            "last_activity": datetime(2026, 2, 17, 12, 0, 0),
+            "event_ids": ["e1", "e2"],
+        }]
+
+        result = await engine._create_graph_nodes([], {}, thread_data)
+
+        mock_neo4j.create_thread_node.assert_called_once_with(
+            thread_id="thread1",
+            topic="deployment pipeline",
+            phase="discussion",
+            started_at=datetime(2026, 2, 17, 10, 0, 0),
+            last_activity=datetime(2026, 2, 17, 12, 0, 0),
+            source_event_ids=["e1", "e2"],
+        )
+        assert "T_thread1" in result
+
+    @pytest.mark.asyncio
+    async def test_create_graph_nodes_no_thread_data_still_works(self):
+        """Omitting thread_data (default None) must not raise."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+        mock_neo4j = MagicMock()
+        mock_neo4j.create_or_update_user.return_value = "U1"
+        engine.neo4j_writer = mock_neo4j
+
+        events = [{"event_id": "e1", "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+                   "source_system": "slack", "user_id": "U1", "text": "hi", "metadata": {}}]
+
+        # No thread_data argument — should default to [] and not call create_thread_node
+        result = await engine._create_graph_nodes(events, {})
+        mock_neo4j.create_thread_node.assert_not_called()
+        assert "U1" in result
+
+    @pytest.mark.asyncio
+    async def test_create_graph_nodes_thread_ids_deduplicated(self):
+        """Same thread_id from two thread dicts should appear once in node_ids."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+        mock_neo4j = MagicMock()
+        mock_neo4j.create_thread_node.return_value = "T_same"
+        engine.neo4j_writer = mock_neo4j
+
+        thread_data = [
+            {"thread_id": "t1", "topic": "a", "phase": "initiation",
+             "started_at": datetime(2026, 2, 17, 10, 0, 0),
+             "last_activity": datetime(2026, 2, 17, 10, 0, 0),
+             "event_ids": []},
+            {"thread_id": "t2", "topic": "b", "phase": "discussion",
+             "started_at": datetime(2026, 2, 17, 11, 0, 0),
+             "last_activity": datetime(2026, 2, 17, 11, 0, 0),
+             "event_ids": []},
+        ]
+
+        result = await engine._create_graph_nodes([], {}, thread_data)
+        # Both calls return "T_same" — should only be in list once
+        assert result.count("T_same") == 1
+
+    @pytest.mark.asyncio
+    async def test_analyze_threads_returns_list_of_dicts(self):
+        """_analyze_threads must return a list (possibly empty), not None."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+
+        mock_analyzer = MagicMock()
+        mock_analyzer.process_events = AsyncMock(return_value=[])
+        mock_analyzer.active_threads = {}
+        engine.thread_analyzer = mock_analyzer
+
+        result = await engine._analyze_threads([], {})
+        assert isinstance(result, list)
+
+    @pytest.mark.asyncio
+    async def test_analyze_threads_exposes_active_thread_data(self):
+        """_analyze_threads must return data from active_threads for graph wiring."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+
+        mock_analyzer = MagicMock()
+        mock_analyzer.process_events = AsyncMock(return_value=["ctx-1"])
+        mock_analyzer.active_threads = {
+            "T001": {
+                "context_id": "ctx-1",
+                "thread_id": "T001",
+                "channel_id": "C1",
+                "topic": "deployment",
+                "phase": "discussion",
+                "started_at": datetime(2026, 2, 17, 10, 0, 0),
+                "last_activity": datetime(2026, 2, 17, 12, 0, 0),
+                "event_ids": ["e1", "e2", None],  # None placeholder should be filtered
+            }
+        }
+        engine.thread_analyzer = mock_analyzer
+
+        result = await engine._analyze_threads([], {})
+        assert len(result) == 1
+        td = result[0]
+        assert td["thread_id"] == "T001"
+        assert td["channel_id"] == "C1"
+        assert td["topic"] == "deployment"
+        # None should be stripped from event_ids
+        assert None not in td["event_ids"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel Summary LLM (Priority: LLM summarizes thread summaries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestChannelSummaryLLM:
+    """
+    Verify that ChannelSummarizer uses the LLM when thread summaries exist,
+    and falls back to keyword extraction when OpenAI is unavailable.
+    """
+
+    def _make_pool(self, rows=None):
+        """Return a mock asyncpg pool whose acquire() returns rows on fetch."""
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=rows or [])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_pool = MagicMock()
+        mock_pool.acquire = MagicMock(return_value=ctx)
+        return mock_pool, mock_conn
+
+    @pytest.mark.asyncio
+    async def test_get_channel_thread_summaries_queries_db(self):
+        """_get_channel_thread_summaries must query thread_contexts for the channel."""
+        from interpreter.channel_summarizer import ChannelSummarizer
+
+        pool, mock_conn = self._make_pool(rows=[
+            {"thread_id": "T1", "topic": "deploy", "phase": "discussion",
+             "pattern": "Q&A", "decisions_made": ["use docker"],
+             "message_count": 10, "participant_count": 2,
+             "last_activity": datetime(2026, 2, 17, 12, 0, 0)},
+        ])
+
+        cs = ChannelSummarizer.__new__(ChannelSummarizer)
+        cs.pool = pool
+        cs._openai_client = None
+
+        result = await cs._get_channel_thread_summaries("C_test")
+        mock_conn.fetch.assert_called_once()
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "thread_contexts" in call_sql
+        assert len(result) == 1
+        assert result[0]["topic"] == "deploy"
+
+    @pytest.mark.asyncio
+    async def test_llm_summarize_threads_calls_openai(self):
+        """_llm_summarize_threads must call OpenAI and return summary_text."""
+        from interpreter.channel_summarizer import ChannelSummarizer
+
+        pool, _ = self._make_pool()
+        cs = ChannelSummarizer.__new__(ChannelSummarizer)
+        cs.pool = pool
+        cs._openai_model = "gpt-4o-mini"
+
+        # Mock OpenAI client
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = "The channel discussed deployment pipeline and Docker."
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        cs._openai_client = mock_client
+
+        thread_summaries = [{
+            "topic": "deployment pipeline",
+            "phase": "discussion",
+            "pattern": "Q&A",
+            "decisions_made": ["use docker"],
+            "message_count": 8,
+            "participant_count": 3,
+        }]
+        channel_events = [
+            {"event_id": "e1", "user_id": "U1",
+             "observed_at": datetime(2026, 2, 17, 12, 0, 0), "text": "hello"},
+        ]
+
+        result = await cs._llm_summarize_threads(
+            channel_name="general",
+            thread_summaries=thread_summaries,
+            channel_events=channel_events,
+        )
+
+        mock_client.chat.completions.create.assert_called_once()
+        assert "summary_text" in result
+        assert "The channel" in result["summary_text"]
+        assert result["participant_count"] == 1  # 1 unique user
+
+    @pytest.mark.asyncio
+    async def test_llm_fallback_when_openai_unavailable(self):
+        """When _openai_client is None, channel summary falls back to keyword extraction."""
+        from interpreter.channel_summarizer import ChannelSummarizer
+
+        # thread_contexts returns empty (no threads yet)
+        pool, mock_conn = self._make_pool(rows=[])
+        mock_conn.fetchrow = AsyncMock(return_value=None)  # no previous summary
+
+        cs = ChannelSummarizer.__new__(ChannelSummarizer)
+        cs.pool = pool
+        cs._openai_client = None  # no LLM
+        cs._openai_model = "gpt-4o-mini"
+        cs.drift_threshold = 0.3
+        cs._recent_events = {}
+
+        channel_events = [
+            {"event_id": "e1", "user_id": "U1", "channel_id": "C1",
+             "channel_name": "general", "source_system": "slack",
+             "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+             "text": "let us deploy the docker container"},
+            {"event_id": "e2", "user_id": "U2", "channel_id": "C1",
+             "channel_name": "general", "source_system": "slack",
+             "observed_at": datetime(2026, 2, 17, 12, 0, 1),
+             "text": "agreed sounds good"},
+        ]
+
+        # _write_summary needs fetchrow to return a summary_id
+        mock_write_row = MagicMock()
+        mock_write_row.__getitem__ = MagicMock(
+            side_effect=lambda k: "sum-uuid-1234" if k == "summary_id" else None
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_write_row)
+
+        result = await cs._create_summary(
+            channel_id="C1",
+            channel_events=channel_events,
+            total_count=2,
+        )
+        # Should not raise; result is a summary_id string
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_llm_fallback_on_openai_error(self):
+        """If OpenAI raises during _llm_summarize_threads, fallback to keyword extraction."""
+        from interpreter.channel_summarizer import ChannelSummarizer
+
+        pool, _ = self._make_pool()
+        cs = ChannelSummarizer.__new__(ChannelSummarizer)
+        cs.pool = pool
+        cs._openai_model = "gpt-4o-mini"
+
+        # Client that raises on call
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = RuntimeError("rate limit")
+        cs._openai_client = mock_client
+
+        thread_summaries = [{"topic": "testing", "phase": "initiation",
+                              "pattern": "Q&A", "decisions_made": [],
+                              "message_count": 3, "participant_count": 1}]
+        channel_events = [
+            {"event_id": "e1", "user_id": "U1",
+             "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+             "text": "how does this work"},
+        ]
+
+        result = await cs._llm_summarize_threads(
+            channel_name="general",
+            thread_summaries=thread_summaries,
+            channel_events=channel_events,
+        )
+        # Should fall back to keyword analysis dict (has summary_text key)
+        assert "summary_text" in result
+        # summary_text from keyword fallback uses _generate_summary_text pattern
+        assert "messages" in result["summary_text"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -220,7 +220,9 @@ class InterpreterEngine:
 
         self.channel_summarizer = ChannelSummarizer(
             postgres_pool=self.postgres_writer.pool,
-            drift_threshold=float(os.getenv("SUMMARY_DRIFT_THRESHOLD", 0.3))
+            drift_threshold=float(os.getenv("SUMMARY_DRIFT_THRESHOLD", 0.3)),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_model=os.getenv("SUMMARY_LLM_MODEL", "gpt-4o-mini"),
         )
         await self.channel_summarizer.initialize()
 
@@ -298,7 +300,8 @@ class InterpreterEngine:
                 (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             )
 
-            graph_node_ids = await self._create_graph_nodes(events, intents)
+            thread_data = await self._analyze_threads(events, intents)
+            graph_node_ids = await self._create_graph_nodes(events, intents, thread_data)
 
             interpretation_id = await self.postgres_writer.write_interpretation(
                 window_start=events[0]["observed_at"],
@@ -310,7 +313,6 @@ class InterpreterEngine:
                 processing_duration_ms=processing_ms,
                 graph_node_ids=graph_node_ids
             )
-            await self._analyze_threads(events, intents)
             await self._track_user_sessions(events, intents)
             await self._generate_channel_summaries(events)
             await self._track_intent_embeddings(events, intents)
@@ -440,7 +442,12 @@ class InterpreterEngine:
 
     # ── Downstream consumers ──────────────────────────────────────────────────
 
-    async def _create_graph_nodes(self, events, intents) -> List[str]:
+    async def _create_graph_nodes(
+        self,
+        events,
+        intents,
+        thread_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
         """Create Neo4j nodes and return all node IDs created."""
         node_ids: List[str] = []
         users: Dict[str, Any] = {}
@@ -479,15 +486,45 @@ class InterpreterEngine:
                         node_ids.append(nid)
                 except Exception as e:
                     logger.error(f"Neo4j intent node error: {e}")
+        # ── Thread nodes ──
+        for td in (thread_data or []):
+            try:
+                nid = self.neo4j_writer.create_thread_node(
+                    thread_id=td["thread_id"],
+                    topic=td.get("topic"),
+                    phase=td.get("phase"),
+                    started_at=td["started_at"],
+                    last_activity=td["last_activity"],
+                    source_event_ids=[eid for eid in td.get("event_ids", []) if eid],
+                )
+                if nid and nid not in node_ids:
+                    node_ids.append(nid)
+            except Exception as e:
+                logger.error(f"Neo4j thread node error for {td.get('thread_id')}: {e}")
         return node_ids
 
-    async def _analyze_threads(self, events, intents):
+    async def _analyze_threads(self, events, intents) -> List[Dict[str, Any]]:
+        """Analyze threads and return thread data for Neo4j node creation."""
         try:
-            threads = await self.thread_analyzer.process_events(events, intents)
-            if threads:
-                logger.debug(f"Analyzed {len(threads)} threads")
+            context_ids = await self.thread_analyzer.process_events(events, intents)
+            if context_ids:
+                logger.debug(f"Analyzed {len(context_ids)} threads")
+            # Return the in-memory thread data for Neo4j wiring
+            thread_data = []
+            for thread_id, td in self.thread_analyzer.active_threads.items():
+                thread_data.append({
+                    "thread_id": thread_id,
+                    "channel_id": td.get("channel_id"),
+                    "topic": td.get("topic"),
+                    "phase": td.get("phase"),
+                    "started_at": td.get("started_at"),
+                    "last_activity": td.get("last_activity"),
+                    "event_ids": [eid for eid in td.get("event_ids", []) if eid],
+                })
+            return thread_data
         except Exception as e:
             logger.error(f"Error analyzing threads: {e}", exc_info=True)
+            return []
 
     async def _track_user_sessions(self, events, intents):
         try:
