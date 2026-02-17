@@ -298,6 +298,8 @@ class InterpreterEngine:
                 (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             )
 
+            graph_node_ids = await self._create_graph_nodes(events, intents)
+
             interpretation_id = await self.postgres_writer.write_interpretation(
                 window_start=events[0]["observed_at"],
                 window_end=events[-1]["observed_at"],
@@ -305,10 +307,9 @@ class InterpreterEngine:
                 intents=intents,
                 correlations=correlations,
                 anomalies=anomalies,
-                processing_duration_ms=processing_ms
+                processing_duration_ms=processing_ms,
+                graph_node_ids=graph_node_ids
             )
-
-            await self._create_graph_nodes(events, intents)
             await self._analyze_threads(events, intents)
             await self._track_user_sessions(events, intents)
             await self._generate_channel_summaries(events)
@@ -439,7 +440,9 @@ class InterpreterEngine:
 
     # ── Downstream consumers ──────────────────────────────────────────────────
 
-    async def _create_graph_nodes(self, events, intents):
+    async def _create_graph_nodes(self, events, intents) -> List[str]:
+        """Create Neo4j nodes and return all node IDs created."""
+        node_ids: List[str] = []
         users: Dict[str, Any] = {}
         for event in events:
             user_id = event.get("user_id")
@@ -455,23 +458,28 @@ class InterpreterEngine:
         for user_id, data in users.items():
             for source_system in data["sources"]:
                 try:
-                    self.neo4j_writer.create_or_update_user(
+                    nid = self.neo4j_writer.create_or_update_user(
                         user_id=user_id, source_system=source_system,
                         first_seen=data["first_seen"], last_active=data["last_active"],
                         interaction_count=data["count"])
+                    if nid and nid not in node_ids:
+                        node_ids.append(nid)
                 except Exception as e:
                     logger.error(f"Neo4j user node error for {user_id}: {e}")
         for event_id, intent_list in intents.items():
             for intent in intent_list:
                 try:
-                    self.neo4j_writer.create_intent_node(
+                    nid = self.neo4j_writer.create_intent_node(
                         intent_id=f"intent_{event_id}_{intent['type']}",
                         intent_type=intent["type"], category=intent["category"],
                         text=intent["text"], confidence=intent["confidence"],
                         actor_id=intent.get("actor_id"), source_event_ids=[event_id],
                         timestamp=intent["timestamp"])
+                    if nid and nid not in node_ids:
+                        node_ids.append(nid)
                 except Exception as e:
                     logger.error(f"Neo4j intent node error: {e}")
+        return node_ids
 
     async def _analyze_threads(self, events, intents):
         try:

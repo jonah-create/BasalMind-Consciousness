@@ -82,7 +82,8 @@ class PostgresWriter:
         intents: Dict[str, List[Dict[str, Any]]],
         correlations: Optional[List[Dict[str, Any]]] = None,
         anomalies: Optional[List[Dict[str, Any]]] = None,
-        processing_duration_ms: Optional[int] = None
+        processing_duration_ms: Optional[int] = None,
+        graph_node_ids: Optional[List[str]] = None
     ) -> str:
         """
         Write an interpretation record for a processing window.
@@ -134,8 +135,9 @@ class PostgresWriter:
                 correlations,
                 anomalies,
                 entities,
-                deduplication_metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                deduplication_metadata,
+                graph_node_ids
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING interpretation_id
         """
         
@@ -153,7 +155,8 @@ class PostgresWriter:
                 json.dumps(correlations) if correlations else None,
                 json.dumps(anomalies) if anomalies else None,
                 json.dumps(entities) if entities else None,
-                json.dumps(dedup_metadata) if dedup_metadata else None
+                json.dumps(dedup_metadata) if dedup_metadata else None,
+                graph_node_ids or []
             )
             
         interpretation_id = str(result)

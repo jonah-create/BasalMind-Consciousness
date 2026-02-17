@@ -9,6 +9,7 @@ import pytest
 import asyncio
 import json
 import math
+import uuid
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, AsyncMock, call
 import sys
@@ -680,6 +681,290 @@ class TestDriftComputation:
         perturbed = [x + random.gauss(0, 0.01) for x in base]
         drift = self._cosine_distance(base, perturbed)
         assert drift < 0.01  # similar vectors should have low drift
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph Node IDs Linkage (Priority 1: Postgres ↔ Neo4j lineage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGraphNodeIdsLinkage:
+    """
+    Verify that Neo4j node IDs created during a batch are stored on the
+    interpretations record in PostgreSQL, enabling Postgres→Neo4j traversal.
+    """
+
+    def _make_async_pool(self, mock_conn):
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_pool = MagicMock()
+        mock_pool.acquire = MagicMock(return_value=ctx)
+        return mock_pool
+
+    # ── PostgresWriter: write_interpretation accepts graph_node_ids ──────────
+
+    @pytest.mark.asyncio
+    async def test_write_interpretation_accepts_graph_node_ids(self):
+        """write_interpretation must accept graph_node_ids without error."""
+        from interpreter.postgres_writer import PostgresWriter
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+
+        writer = PostgresWriter.__new__(PostgresWriter)
+        writer.pool = self._make_async_pool(mock_conn)
+
+        events = [{
+            "event_id": str(uuid.uuid4()),
+            "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+            "source_system": "slack",
+            "text": "test",
+            "user_id": "U1",
+            "metadata": {},
+        }]
+        intents = {}
+
+        # Must not raise even with graph_node_ids supplied
+        result = await writer.write_interpretation(
+            window_start=datetime(2026, 2, 17, 12, 0, 0),
+            window_end=datetime(2026, 2, 17, 12, 0, 1),
+            events=events,
+            intents=intents,
+            graph_node_ids=["U1", "intent_evt1_asking_question"],
+        )
+        assert result == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    @pytest.mark.asyncio
+    async def test_write_interpretation_stores_graph_node_ids_in_query(self):
+        """graph_node_ids must be passed as the 13th positional arg to fetchval."""
+        from interpreter.postgres_writer import PostgresWriter
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+
+        writer = PostgresWriter.__new__(PostgresWriter)
+        writer.pool = self._make_async_pool(mock_conn)
+
+        node_ids = ["U99", "intent_e1_making_decision"]
+        events = [{
+            "event_id": str(uuid.uuid4()),
+            "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+            "source_system": "slack",
+            "text": "let's ship it",
+            "user_id": "U99",
+            "metadata": {},
+        }]
+
+        await writer.write_interpretation(
+            window_start=datetime(2026, 2, 17, 12, 0, 0),
+            window_end=datetime(2026, 2, 17, 12, 0, 1),
+            events=events,
+            intents={},
+            graph_node_ids=node_ids,
+        )
+
+        call_args = mock_conn.fetchval.call_args[0]
+        # arg[0] is the SQL string; args[1..12] are positional params; [13] is graph_node_ids
+        stored_ids = call_args[13]
+        assert stored_ids == node_ids
+
+    @pytest.mark.asyncio
+    async def test_write_interpretation_defaults_to_empty_list(self):
+        """Omitting graph_node_ids should default to empty list, not None."""
+        from interpreter.postgres_writer import PostgresWriter
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+
+        writer = PostgresWriter.__new__(PostgresWriter)
+        writer.pool = self._make_async_pool(mock_conn)
+
+        events = [{
+            "event_id": str(uuid.uuid4()),
+            "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+            "source_system": "slack",
+            "text": "hello",
+            "user_id": "U1",
+            "metadata": {},
+        }]
+
+        await writer.write_interpretation(
+            window_start=datetime(2026, 2, 17, 12, 0, 0),
+            window_end=datetime(2026, 2, 17, 12, 0, 1),
+            events=events,
+            intents={},
+            # graph_node_ids omitted
+        )
+
+        call_args = mock_conn.fetchval.call_args[0]
+        stored_ids = call_args[13]
+        assert stored_ids == []  # not None
+
+    # ── Neo4jWriter: return values ───────────────────────────────────────────
+
+    def test_neo4j_writer_create_or_update_user_returns_string(self):
+        """create_or_update_user must return a non-empty string node ID."""
+        from interpreter.neo4j_writer import Neo4jWriter
+
+        mock_session = MagicMock()
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"node_id": "U42"}
+        mock_session.run.return_value = mock_result
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_driver = MagicMock()
+        mock_driver.session.return_value = mock_session
+
+        writer = Neo4jWriter.__new__(Neo4jWriter)
+        writer.driver = mock_driver
+        writer.database = "neo4j"
+        writer.namespace = "interpreter"
+
+        result = writer.create_or_update_user(
+            user_id="U42",
+            source_system="slack",
+            first_seen=datetime(2026, 2, 17, 10, 0, 0),
+            last_active=datetime(2026, 2, 17, 12, 0, 0),
+            interaction_count=5,
+        )
+        assert isinstance(result, str)
+        assert result == "U42"
+
+    def test_neo4j_writer_create_intent_node_returns_string(self):
+        """create_intent_node must return a non-empty string node ID."""
+        from interpreter.neo4j_writer import Neo4jWriter
+
+        mock_session = MagicMock()
+        mock_result = MagicMock()
+        intent_id = "intent_evt1_asking_question"
+        mock_result.single.return_value = {"node_id": intent_id}
+        mock_session.run.return_value = mock_result
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_driver = MagicMock()
+        mock_driver.session.return_value = mock_session
+
+        writer = Neo4jWriter.__new__(Neo4jWriter)
+        writer.driver = mock_driver
+        writer.database = "neo4j"
+        writer.namespace = "interpreter"
+
+        result = writer.create_intent_node(
+            intent_id=intent_id,
+            intent_type="asking_question",
+            category="information_seeking",
+            text="How does this work?",
+            confidence=0.85,
+            actor_id="U42",
+            source_event_ids=["evt-1"],
+            timestamp=datetime(2026, 2, 17, 12, 0, 0),
+        )
+        assert isinstance(result, str)
+        assert result == intent_id
+
+    def test_neo4j_writer_returns_fallback_when_no_record(self):
+        """If Neo4j returns no record, the node ID input is used as fallback."""
+        from interpreter.neo4j_writer import Neo4jWriter
+
+        mock_session = MagicMock()
+        mock_result = MagicMock()
+        mock_result.single.return_value = None   # ← no record returned
+        mock_session.run.return_value = mock_result
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_driver = MagicMock()
+        mock_driver.session.return_value = mock_session
+
+        writer = Neo4jWriter.__new__(Neo4jWriter)
+        writer.driver = mock_driver
+        writer.database = "neo4j"
+        writer.namespace = "interpreter"
+
+        result = writer.create_or_update_user(
+            user_id="U_fallback",
+            source_system="slack",
+            first_seen=datetime(2026, 2, 17, 10, 0, 0),
+            last_active=datetime(2026, 2, 17, 12, 0, 0),
+        )
+        assert result == "U_fallback"
+
+    # ── Engine: _create_graph_nodes returns list ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_engine_create_graph_nodes_returns_list(self):
+        """_create_graph_nodes must return a list (possibly empty)."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+
+        # neo4j_writer that returns deterministic IDs
+        mock_neo4j = MagicMock()
+        mock_neo4j.create_or_update_user.return_value = "U1"
+        mock_neo4j.create_intent_node.return_value = "intent_e1_asking_question"
+        engine.neo4j_writer = mock_neo4j
+
+        events = [{
+            "event_id": "e1",
+            "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+            "source_system": "slack",
+            "user_id": "U1",
+            "text": "hello",
+            "metadata": {},
+        }]
+        intents = {
+            "e1": [{
+                "type": "asking_question",
+                "category": "information_seeking",
+                "text": "hello",
+                "confidence": 0.8,
+                "actor_id": "U1",
+                "timestamp": datetime(2026, 2, 17, 12, 0, 0),
+            }]
+        }
+
+        result = await engine._create_graph_nodes(events, intents)
+        assert isinstance(result, list)
+        assert "U1" in result
+        assert "intent_e1_asking_question" in result
+
+    @pytest.mark.asyncio
+    async def test_engine_create_graph_nodes_deduplicates_node_ids(self):
+        """Same user appearing in multiple events should appear once in node_ids."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+
+        mock_neo4j = MagicMock()
+        mock_neo4j.create_or_update_user.return_value = "U1"  # same ID each call
+        mock_neo4j.create_intent_node.return_value = "intent_e1_asking_question"
+        engine.neo4j_writer = mock_neo4j
+
+        events = [
+            {"event_id": "e1", "observed_at": datetime(2026, 2, 17, 12, 0, 0),
+             "source_system": "slack", "user_id": "U1", "text": "msg1", "metadata": {}},
+            {"event_id": "e2", "observed_at": datetime(2026, 2, 17, 12, 0, 1),
+             "source_system": "slack", "user_id": "U1", "text": "msg2", "metadata": {}},
+        ]
+        intents = {"e1": [{"type": "asking_question", "category": "information_seeking",
+                            "text": "msg1", "confidence": 0.8, "actor_id": "U1",
+                            "timestamp": datetime(2026, 2, 17, 12, 0, 0)}]}
+
+        result = await engine._create_graph_nodes(events, intents)
+        # U1 appears twice from two events but should only be in list once
+        assert result.count("U1") == 1
+
+    @pytest.mark.asyncio
+    async def test_engine_create_graph_nodes_empty_events(self):
+        """Empty events and intents should return an empty list, not raise."""
+        import interpreter.engine as eng
+
+        engine = eng.InterpreterEngine.__new__(eng.InterpreterEngine)
+        engine.neo4j_writer = MagicMock()
+
+        result = await engine._create_graph_nodes([], {})
+        assert result == []
 
 
 if __name__ == "__main__":
