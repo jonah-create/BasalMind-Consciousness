@@ -108,12 +108,9 @@ class Neo4jWriter:
                 i.confidence = $confidence,
                 i.extracted_at = datetime($timestamp)
                 
-            // Create/link Actor and User if provided (User is the canonical identity node)
+            // Link to User node (canonical identity — Actor is redundant, User covers it)
             WITH i
             {f'''
-            MERGE (a:{self._label('Actor')} {{id: $actor_id}})
-            MERGE (a)-[:{self._label('PERFORMED')}]->(i)
-            WITH i, a
             MERGE (u:{self._label('User')} {{id: $actor_id}})
             MERGE (u)-[:{self._label('PERFORMED')}]->(i)
             ''' if actor_id else ''}
