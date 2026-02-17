@@ -48,82 +48,237 @@ class EmbeddingGenerator:
         """
         self.model_name = model_name
         self.postgres_pool = postgres_pool
-        
-        # Initialize OpenAI client
-        openai.api_key = openai_api_key
-        
+
+        # Initialize OpenAI client (openai>=1.0.0 style)
+        self.client = openai.OpenAI(api_key=openai_api_key)
+
         # Embedding configuration
         self.max_tokens = 8000  # ada-002 limit
         self.embedding_dim = 1536  # ada-002 dimension
         
+    async def _call_openai(self, text: str) -> Optional[List[float]]:
+        """Call OpenAI embeddings API and return the vector."""
+        try:
+            response = await asyncio.to_thread(
+                self.client.embeddings.create,
+                input=text,
+                model=self.model_name
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"OpenAI embedding call failed: {e}")
+            return None
+
+    async def generate_turn_embedding(
+        self,
+        event_id: str,
+        text: str,
+        thread_id: str,
+        interpretation_id: Optional[str] = None
+    ) -> Optional[List[float]]:
+        """
+        Generate and store an embedding for a single turn (message).
+
+        Args:
+            event_id: The event UUID for this turn
+            text: The message text
+            thread_id: Parent thread this turn belongs to
+            interpretation_id: Lineage to interpretation record
+
+        Returns:
+            Embedding vector or None if failed
+        """
+        if not text or not text.strip():
+            return None
+
+        max_chars = self.max_tokens * 4
+        text = text[:max_chars]
+
+        embedding = await self._call_openai(text)
+        if embedding is None:
+            return None
+
+        logger.info(f"🧠 Turn embedding: event={event_id[:8]}... ({len(text)} chars → {len(embedding)} dims)")
+
+        if self.postgres_pool:
+            await self._store_embedding(
+                entity_type="turn",
+                entity_id=event_id,
+                embedding_type="semantic",
+                embedding=embedding,
+                text_content=text,
+                source_event_ids=[event_id],
+                interpretation_id=interpretation_id
+            )
+
+        return embedding
+
     async def generate_thread_embedding(
         self,
         thread_id: str,
         events: List[Dict[str, Any]],
-        interpretation_id: Optional[str] = None
+        interpretation_id: Optional[str] = None,
+        # Optional context from thread_analyzer for richer history snapshots
+        channel_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        pattern: Optional[str] = None,
+        participant_count: Optional[int] = None,
+        message_count: Optional[int] = None,
     ) -> Optional[List[float]]:
         """
-        Generate semantic embedding for a thread/conversation.
-        
-        Works for:
-        - Slack conversation threads
-        - nginx request sequences
-        - Cloudflare traffic patterns
-        - Any event sequence
-        
+        Generate and store a composite embedding for a thread.
+
+        Concatenates all turn texts in the thread (chronological order)
+        and embeds the result. Always overwrites the previous thread embedding
+        so it reflects the current full conversation context.
+
+        Also appends an immutable snapshot to thread_embedding_history so the
+        full semantic trajectory of the thread is preserved for trend analysis.
+
         Args:
             thread_id: Unique thread identifier
-            events: List of events in this thread
+            events: All events in this thread (current batch)
             interpretation_id: Lineage to interpretation record
-            
+            channel_id: Slack channel (for history index)
+            phase: Thread lifecycle phase at time of snapshot
+            pattern: Conversation pattern at time of snapshot
+            participant_count: Unique speakers so far
+            message_count: Total messages when snapshot was taken
+
         Returns:
-            Embedding vector (1536 dimensions) or None if failed
+            Embedding vector or None if failed
         """
-        # Aggregate text from all events
         text_content = self._aggregate_thread_text(events)
-        
         if not text_content:
-            logger.warning(f"No text content for thread {thread_id}, skipping embedding")
             return None
-            
-        # Truncate to token limit (rough estimate: 1 token ≈ 4 chars)
+
         max_chars = self.max_tokens * 4
-        if len(text_content) > max_chars:
-            text_content = text_content[:max_chars]
-            logger.debug(f"Truncated thread {thread_id} text to {max_chars} chars")
-            
-        try:
-            # Generate embedding via OpenAI
-            response = await asyncio.to_thread(
-                openai.Embedding.create,
-                input=text_content,
-                model=self.model_name
-            )
-            
-            embedding = response['data'][0]['embedding']
-            
-            logger.info(
-                f"🧠 Generated embedding for thread {thread_id} "
-                f"({len(text_content)} chars → {len(embedding)} dims)"
-            )
-            
-            # Store in database if pool provided
-            if self.postgres_pool:
-                await self._store_embedding(
-                    entity_type="thread",
-                    entity_id=thread_id,
-                    embedding_type="semantic",
-                    embedding=embedding,
-                    text_content=text_content,
-                    source_event_ids=[e["event_id"] for e in events],
-                    interpretation_id=interpretation_id
-                )
-                
-            return embedding
-            
-        except Exception as e:
-            logger.error(f"Failed to generate embedding for thread {thread_id}: {e}")
+        text_content = text_content[:max_chars]
+
+        embedding = await self._call_openai(text_content)
+        if embedding is None:
             return None
+
+        logger.info(
+            f"🧠 Thread embedding: thread={thread_id[:20]}... "
+            f"({len(events)} turns, {len(text_content)} chars → {len(embedding)} dims)"
+        )
+
+        if self.postgres_pool:
+            # 1. Overwrite current embedding in embeddings table
+            await self._store_embedding(
+                entity_type="thread",
+                entity_id=thread_id,
+                embedding_type="semantic",
+                embedding=embedding,
+                text_content=text_content,
+                source_event_ids=[e["event_id"] for e in events],
+                interpretation_id=interpretation_id
+            )
+
+            # 2. Append immutable history snapshot
+            await self._store_thread_history_snapshot(
+                thread_id=thread_id,
+                channel_id=channel_id or (events[0].get("channel_id") if events else None),
+                embedding=embedding,
+                text_content=text_content,
+                model_name=self.model_name,
+                phase=phase,
+                pattern=pattern,
+                participant_count=participant_count,
+                message_count=message_count if message_count is not None else len(events),
+                interpretation_id=interpretation_id
+            )
+
+        return embedding
+
+    async def _store_thread_history_snapshot(
+        self,
+        thread_id: str,
+        channel_id: Optional[str],
+        embedding: List[float],
+        text_content: str,
+        model_name: str,
+        phase: Optional[str],
+        pattern: Optional[str],
+        participant_count: Optional[int],
+        message_count: int,
+        interpretation_id: Optional[str] = None,
+    ):
+        """
+        Append an immutable snapshot row to thread_embedding_history.
+
+        Automatically:
+        - Increments snapshot_index by querying the current max for this thread
+        - Computes drift_from_prev as cosine distance from the previous snapshot's vector
+        """
+        if not self.postgres_pool:
+            return
+
+        import json as _json
+        import math as _math
+
+        embedding_str = _json.dumps(embedding)
+
+        async with self.postgres_pool.acquire() as conn:
+            # Get the previous snapshot index and vector in one query
+            prev_row = await conn.fetchrow(
+                """
+                SELECT snapshot_index, embedding::text AS emb_str
+                FROM thread_embedding_history
+                WHERE thread_id = $1
+                ORDER BY snapshot_index DESC
+                LIMIT 1
+                """,
+                thread_id
+            )
+
+            if prev_row:
+                next_index = prev_row["snapshot_index"] + 1
+                # Compute cosine distance from previous embedding
+                try:
+                    prev_vec = _json.loads(prev_row["emb_str"])
+                    dot = sum(a * b for a, b in zip(embedding, prev_vec))
+                    mag_a = _math.sqrt(sum(x * x for x in embedding))
+                    mag_b = _math.sqrt(sum(x * x for x in prev_vec))
+                    cosine_sim = dot / (mag_a * mag_b) if mag_a and mag_b else 0.0
+                    drift = 1.0 - cosine_sim  # distance: 0=same, 1=orthogonal
+                except Exception:
+                    drift = None
+            else:
+                next_index = 1
+                drift = None  # first snapshot — no previous to compare
+
+            await conn.execute(
+                """
+                INSERT INTO thread_embedding_history (
+                    thread_id, channel_id,
+                    snapshot_index, message_count,
+                    phase, pattern, participant_count,
+                    model_name, embedding,
+                    text_content, drift_from_prev,
+                    source_interpretation_id
+                ) VALUES (
+                    $1, $2, $3, $4,
+                    $5, $6, $7,
+                    $8, $9::vector,
+                    $10, $11, $12
+                )
+                """,
+                thread_id, channel_id,
+                next_index, message_count,
+                phase, pattern, participant_count,
+                model_name, embedding_str,
+                text_content[:2000],  # store more than embeddings table (trend context)
+                drift,
+                interpretation_id if interpretation_id else None
+            )
+
+        drift_str = f"{drift:.4f}" if drift is not None else "N/A"
+        logger.debug(
+            f"📜 Thread history snapshot: thread={thread_id[:20]}... "
+            f"index={next_index}, drift={drift_str}"
+        )
             
     def _aggregate_thread_text(self, events: List[Dict[str, Any]]) -> str:
         """
@@ -220,6 +375,10 @@ class EmbeddingGenerator:
         # Estimate token count (rough: 1 token ≈ 4 chars)
         token_count = len(text_content) // 4
         
+        # pgvector requires the embedding as a string "[x, y, z, ...]" for ::vector cast
+        import json as _json
+        embedding_str = _json.dumps(embedding)
+
         async with self.postgres_pool.acquire() as conn:
             await conn.execute(
                 query,
@@ -227,7 +386,7 @@ class EmbeddingGenerator:
                 entity_id,
                 embedding_type,
                 self.model_name,
-                embedding,
+                embedding_str,
                 text_content[:1000],  # Store first 1000 chars
                 token_count,
                 interpretation_id,
@@ -236,6 +395,84 @@ class EmbeddingGenerator:
             
         logger.debug(f"💾 Stored embedding: {entity_type}/{entity_id}/{embedding_type}")
         
+    async def generate_channel_embedding(
+        self,
+        channel_id: str,
+        thread_ids: List[str],
+        interpretation_id: Optional[str] = None
+    ) -> Optional[List[float]]:
+        """
+        Generate and store a composite embedding for a channel.
+
+        Mean-pools all thread embedding vectors stored in the embeddings table
+        for the given channel. Always overwrites the previous channel embedding.
+
+        Args:
+            channel_id: Slack channel identifier
+            thread_ids: Thread IDs active in this channel (used for lineage only)
+            interpretation_id: Lineage to interpretation record
+
+        Returns:
+            Mean-pooled embedding vector or None if no thread embeddings found
+        """
+        if not self.postgres_pool:
+            return None
+
+        # Fetch all thread embedding vectors for this channel
+        query = """
+            SELECT embedding::text
+            FROM embeddings
+            WHERE entity_type = 'thread'
+              AND entity_id = ANY($1::text[])
+              AND embedding_type = 'semantic'
+        """
+
+        import json as _json
+        import numpy as _np
+
+        async with self.postgres_pool.acquire() as conn:
+            rows = await conn.fetch(query, thread_ids)
+
+        if not rows:
+            logger.debug(f"No thread embeddings found for channel {channel_id}, skipping channel embedding")
+            return None
+
+        # Parse the pgvector string representations back to lists
+        vectors = []
+        for row in rows:
+            try:
+                # pgvector returns "[x, y, z, ...]" as text
+                vec_str = row["embedding"]
+                vec = _json.loads(vec_str)
+                vectors.append(vec)
+            except Exception:
+                pass
+
+        if not vectors:
+            return None
+
+        # Mean-pool: average each dimension across all thread vectors
+        arr = _np.array(vectors, dtype=_np.float32)
+        mean_vec = arr.mean(axis=0).tolist()
+
+        thread_count = len(vectors)
+        logger.info(
+            f"🧠 Channel embedding: channel={channel_id} "
+            f"(mean-pooled {thread_count} thread vectors → {len(mean_vec)} dims)"
+        )
+
+        await self._store_embedding(
+            entity_type="channel",
+            entity_id=channel_id,
+            embedding_type="semantic",
+            embedding=mean_vec,
+            text_content=f"Channel composite from {thread_count} threads",
+            source_event_ids=[],
+            interpretation_id=interpretation_id
+        )
+
+        return mean_vec
+
     async def search_similar(
         self,
         query_embedding: List[float],

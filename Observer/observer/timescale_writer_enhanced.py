@@ -287,6 +287,20 @@ class EnhancedTimescaleWriter:
             self.write_failures += 1
             return False
 
+
+    @staticmethod
+    def _get_field(event_data: Dict[str, Any], normalized: Dict[str, Any], field: str):
+        """
+        Get field value: check normalized dict first, fall back to top-level event_data.
+
+        This handles both Slack events (which have a populated normalized dict) and
+        internal events (which may have fields only at the top level).
+        """
+        val = normalized.get(field)
+        if val is None:
+            val = event_data.get(field)
+        return val
+
     async def _write_single(self, event_data: Dict[str, Any]) -> bool:
         """Write single event directly (legacy mode)."""
         try:
@@ -309,6 +323,7 @@ class EnhancedTimescaleWriter:
                 observed_at = self._parse_timestamp(event_data.get("observed_at", datetime.utcnow().isoformat()))
                 normalized = event_data.get("normalized", {})
 
+                gf = lambda f: self._get_field(event_data, normalized, f)
                 await conn.execute(
                     query,
                     event_data.get("event_id"),
@@ -316,19 +331,19 @@ class EnhancedTimescaleWriter:
                     observed_at,
                     event_data.get("event_type"),
                     event_data.get("source_system"),
-                    normalized.get("user_id"),
-                    normalized.get("user_name"),
-                    normalized.get("user_email"),
-                    normalized.get("channel_id"),
-                    normalized.get("channel_name"),
-                    normalized.get("thread_id"),
+                    gf("user_id"),
+                    gf("user_name"),
+                    gf("user_email"),
+                    gf("channel_id"),
+                    gf("channel_name"),
+                    gf("thread_id"),
                     event_data.get("session_id"),
-                    normalized.get("workspace_id"),
-                    normalized.get("text"),
-                    normalized.get("subject"),
-                    normalized.get("body"),
-                    normalized.get("action_type"),
-                    normalized.get("action_value"),
+                    gf("workspace_id"),
+                    gf("text"),
+                    gf("subject"),
+                    gf("body"),
+                    gf("action_type"),
+                    gf("action_value"),
                     event_data.get("trace_id"),
                     event_data.get("correlation_id"),
                     json.dumps(event_data.get("raw_payload", {})),
@@ -359,25 +374,26 @@ class EnhancedTimescaleWriter:
                     observed_at = self._parse_timestamp(event_data.get("observed_at"))
                     normalized = event_data.get("normalized", {})
 
+                    gf = lambda f: self._get_field(event_data, normalized, f)
                     rows.append((
                         event_data.get("event_id"),
                         event_time,
                         observed_at,
                         event_data.get("event_type"),
                         event_data.get("source_system"),
-                        normalized.get("user_id"),
-                        normalized.get("user_name"),
-                        normalized.get("user_email"),
-                        normalized.get("channel_id"),
-                        normalized.get("channel_name"),
-                        normalized.get("thread_id"),
+                        gf("user_id"),
+                        gf("user_name"),
+                        gf("user_email"),
+                        gf("channel_id"),
+                        gf("channel_name"),
+                        gf("thread_id"),
                         event_data.get("session_id"),
-                        normalized.get("workspace_id"),
-                        normalized.get("text"),
-                        normalized.get("subject"),
-                        normalized.get("body"),
-                        normalized.get("action_type"),
-                        normalized.get("action_value"),
+                        gf("workspace_id"),
+                        gf("text"),
+                        gf("subject"),
+                        gf("body"),
+                        gf("action_type"),
+                        gf("action_value"),
                         event_data.get("trace_id"),
                         event_data.get("correlation_id"),
                         json.dumps(event_data.get("raw_payload", {})),

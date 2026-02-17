@@ -1,100 +1,66 @@
 """
-Intent Extractor - Phase 1 (Simple Keyword-Based)
+Intent Extractor - Phase 2 (Action-Oriented with Categorical Taxonomy)
 
-Extracts user intents from event text using pattern matching.
-Phase 1 uses simple keyword detection with confidence scoring.
+Extracts user intents for BasalMind - an AI that:
+- Builds software applications and systems
+- Executes projects and implements solutions  
+- Acts as a life coach and supportive buddy
+- Designs processes and manages teams
+- Patches, deploys, and maintains systems
 
-Based on Claude Opus design specification.
+Based on Claude Opus design + Phase 2 enhancements.
 """
 
 import logging
-import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from .intent_taxonomy import BASALMIND_INTENT_TAXONOMY
 
 logger = logging.getLogger(__name__)
 
 
-# Intent type definitions from BasalMind architecture
-INTENT_TYPES = {
-    "asking_question": {
-        "keywords": ["?", "how", "what", "why", "when", "where", "who", "can you", "could you", "would you"],
-        "confidence_boost": 0.2
-    },
-    "requesting_help": {
-        "keywords": ["help", "assist", "support", "need", "stuck", "problem", "issue", "error"],
-        "confidence_boost": 0.15
-    },
-    "providing_information": {
-        "keywords": ["here is", "this is", "fyi", "btw", "note that", "update:", "status:"],
-        "confidence_boost": 0.1
-    },
-    "making_decision": {
-        "keywords": ["decide", "let's use", "we should", "go with", "choose", "pick", "select"],
-        "confidence_boost": 0.25
-    },
-    "expressing_opinion": {
-        "keywords": ["i think", "i believe", "in my opinion", "imo", "imho", "seems like", "looks like"],
-        "confidence_boost": 0.1
-    },
-    "requesting_action": {
-        "keywords": ["please", "can you", "could you", "would you mind", "need you to", "deploy", "fix", "implement"],
-        "confidence_boost": 0.15
-    },
-    "acknowledging": {
-        "keywords": ["thanks", "thank you", "got it", "ok", "okay", "understood", "makes sense", "👍"],
-        "confidence_boost": 0.1
-    },
-    "disagreeing": {
-        "keywords": ["no", "disagree", "but", "however", "actually", "not sure", "i don't think"],
-        "confidence_boost": 0.15
-    },
-    "brainstorming": {
-        "keywords": ["what if", "maybe", "how about", "consider", "alternative", "idea", "thought"],
-        "confidence_boost": 0.12
-    },
-    "troubleshooting": {
-        "keywords": ["error", "bug", "broken", "not working", "failing", "crash", "issue", "debug"],
-        "confidence_boost": 0.18
-    },
-    "planning": {
-        "keywords": ["plan", "schedule", "roadmap", "next", "TODO", "task", "milestone"],
-        "confidence_boost": 0.12
-    },
-    "general_conversation": {
-        "keywords": [],  # Catch-all with low confidence
-        "confidence_boost": 0.0
-    }
-}
-
-
 class IntentExtractor:
     """
-    Extract user intents from text using pattern matching.
+    Extract user intents using BasalMind's comprehensive action-oriented taxonomy.
     
-    Phase 1: Simple keyword-based detection with confidence scoring.
-    Phase 2: Will add LLM-based classification and multi-intent detection.
+    Phase 2: 42 intent types across 11 categories
+    - Captures building, executing, coaching, and managing intents
+    - Categorical structure prevents synonym proliferation
+    - Optimized for action-oriented AI interactions
     """
     
     def __init__(self, confidence_threshold: float = 0.5):
         """
-        Initialize intent extractor.
+        Initialize intent extractor with BasalMind taxonomy.
         
         Args:
             confidence_threshold: Minimum confidence to include an intent (0.0-1.0)
         """
         self.confidence_threshold = confidence_threshold
-        self.intent_types = INTENT_TYPES
+        self.taxonomy = BASALMIND_INTENT_TAXONOMY
+        
+        # Build flat lookup for category resolution
+        self.intent_to_category = {}
+        self.total_intent_types = 0
+        for category, config in self.taxonomy.items():
+            for intent_type in config["intents"].keys():
+                self.intent_to_category[intent_type] = category
+                self.total_intent_types += 1
+        
+        logger.info(
+            f"🎯 Intent Extractor initialized: {self.total_intent_types} intent types "
+            f"across {len(self.taxonomy)} categories"
+        )
         
     def extract_from_event(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Extract intents from a single event.
+        Extract intents from a single event with categorical structure.
         
         Args:
             event: Event dict from TimescaleDB
             
         Returns:
-            List of intent dicts with {type, confidence, text, actor_id, timestamp}
+            List of intent dicts with {category, type, confidence, text, actor_id, timestamp}
         """
         text = event.get("text", "")
         if not text or not isinstance(text, str):
@@ -103,34 +69,35 @@ class IntentExtractor:
         # Normalize text for matching
         text_lower = text.lower()
         
-        # Score all intent types
-        intent_scores = {}
-        for intent_type, config in self.intent_types.items():
-            score = self._score_intent(text_lower, config["keywords"])
-            if score > 0:
-                # Add confidence boost
-                score = min(1.0, score + config["confidence_boost"])
-                intent_scores[intent_type] = score
-                
-        # If no intents detected, default to general_conversation
-        if not intent_scores:
-            intent_scores["general_conversation"] = 0.3
-            
-        # Build intent list
+        # Score all intent types across categories
+        intent_scores = []  # List of (category, intent_type, score)
+        
+        for category, category_config in self.taxonomy.items():
+            for intent_type, intent_config in category_config["intents"].items():
+                score = self._score_intent(text_lower, intent_config["keywords"])
+                if score > 0:
+                    # Add confidence boost
+                    score = min(1.0, score + intent_config["confidence_boost"])
+                    intent_scores.append((category, intent_type, score))
+        
+        # Filter by threshold and deduplicate
         intents = []
-        for intent_type, confidence in intent_scores.items():
-            if confidence >= self.confidence_threshold:
+        seen_intents = set()  # Prevent duplicate intent types
+        
+        for category, intent_type, confidence in sorted(intent_scores, key=lambda x: x[2], reverse=True):
+            if confidence >= self.confidence_threshold and intent_type not in seen_intents:
                 intents.append({
+                    "category": category,
                     "type": intent_type,
                     "confidence": round(confidence, 2),
                     "text": text[:200],  # First 200 chars
                     "actor_id": event.get("user_id"),
-                    "timestamp": (event.get("event_time") or event.get("observed_at")).isoformat(),
-                    "source_event_id": event.get("event_id")
+                    "timestamp": (event.get("event_time") or event.get("observed_at")).isoformat()
+                    if hasattr((event.get("event_time") or event.get("observed_at")), "isoformat")
+                    else str(event.get("event_time") or event.get("observed_at")),
+                    "source_event_id": str(event.get("event_id"))
                 })
-                
-        # Sort by confidence descending
-        intents.sort(key=lambda x: x["confidence"], reverse=True)
+                seen_intents.add(intent_type)
         
         return intents
         
@@ -174,6 +141,7 @@ class IntentExtractor:
             Dict mapping event_id to list of intents
         """
         results = {}
+        category_counts = {}
         
         for event in events:
             event_id = event.get("event_id")
@@ -182,43 +150,104 @@ class IntentExtractor:
                 
             intents = self.extract_from_event(event)
             if intents:
-                results[event_id] = intents
+                results[str(event_id)] = intents
                 
-        logger.info(
-            f"🎯 Extracted intents from {len(results)}/{len(events)} events "
-            f"(avg {sum(len(v) for v in results.values()) / max(len(results), 1):.1f} intents/event)"
-        )
+                # Count categories for stats
+                for intent in intents:
+                    category = intent["category"]
+                    category_counts[category] = category_counts.get(category, 0) + 1
+        
+        if results:
+            logger.info(
+                f"🎯 Extracted intents from {len(results)}/{len(events)} events "
+                f"(avg {sum(len(v) for v in results.values()) / len(results):.1f} intents/event)"
+            )
+            logger.info(f"   Category breakdown: {dict(sorted(category_counts.items()))}")
         
         return results
+    
+    def get_category_for_intent(self, intent_type: str) -> Optional[str]:
+        """
+        Get the category for a given intent type.
+        
+        Args:
+            intent_type: Intent type (e.g., "asking_question")
+            
+        Returns:
+            Category name or None if not found
+        """
+        return self.intent_to_category.get(intent_type)
+    
+    def get_intents_in_category(self, category: str) -> List[str]:
+        """
+        Get all intent types in a category.
+        
+        Args:
+            category: Category name (e.g., "building_creating")
+            
+        Returns:
+            List of intent types in the category
+        """
+        if category in self.taxonomy:
+            return list(self.taxonomy[category]["intents"].keys())
+        return []
+    
+    def get_taxonomy_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of the intent taxonomy.
+        
+        Returns:
+            Dict with taxonomy statistics
+        """
+        summary = {
+            "total_categories": len(self.taxonomy),
+            "total_intent_types": self.total_intent_types,
+            "categories": {}
+        }
+        
+        for category, config in self.taxonomy.items():
+            summary["categories"][category] = {
+                "description": config["description"],
+                "intent_count": len(config["intents"]),
+                "intents": list(config["intents"].keys())
+            }
+        
+        return summary
 
 
 # Example usage
 def test_extractor():
-    """Test the IntentExtractor with sample events."""
+    """Test the Intent Extractor with BasalMind-specific examples."""
     extractor = IntentExtractor(confidence_threshold=0.3)
     
     sample_events = [
         {
-            "event_id": "123",
-            "text": "How do we configure authentication in this system?",
+            "event_id": "1",
+            "text": "Can you build me an app that tracks my daily tasks?",
             "user_id": "U123",
             "event_time": datetime.now()
         },
         {
-            "event_id": "124",
-            "text": "I think we should use PostgreSQL for the database",
+            "event_id": "2",
+            "text": "Deploy the new authentication service to production",
             "user_id": "U123",
             "event_time": datetime.now()
         },
         {
-            "event_id": "125",
-            "text": "Error: Connection timeout when connecting to Redis",
+            "event_id": "3",
+            "text": "I'm feeling stressed about this project deadline",
             "user_id": "U124",
             "event_time": datetime.now()
         },
         {
-            "event_id": "126",
-            "text": "Thanks! That makes sense 👍",
+            "event_id": "4",
+            "text": "Fix the bug in the payment module - it's crashing on checkout",
+            "user_id": "U125",
+            "event_time": datetime.now()
+        },
+        {
+            "event_id": "5",
+            "text": "What's the status on the database migration?",
             "user_id": "U123",
             "event_time": datetime.now()
         }
@@ -226,13 +255,21 @@ def test_extractor():
     
     results = extractor.extract_from_batch(sample_events)
     
-    print("\n🎯 Intent Extraction Results:")
-    print("=" * 60)
+    print("\n🎯 BasalMind Intent Extraction Results:")
+    print("=" * 80)
     for event_id, intents in results.items():
         print(f"\nEvent {event_id}:")
         for intent in intents:
-            print(f"  - {intent['type']}: {intent['confidence']} confidence")
+            print(f"  - [{intent['category']!s:25}] {intent['type']!s:30} ({intent['confidence']})")
             print(f"    Text: {intent['text']}")
+    
+    print("\n📊 Taxonomy Summary:")
+    print("=" * 80)
+    summary = extractor.get_taxonomy_summary()
+    print(f"Total: {summary['total_intent_types']} intent types across {summary['total_categories']} categories\n")
+    for category, info in summary["categories"].items():
+        print(f"{category}: {info['intent_count']} intents")
+        print(f"  Description: {info['description']}")
 
 
 if __name__ == "__main__":

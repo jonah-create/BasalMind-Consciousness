@@ -73,6 +73,7 @@ class Neo4jWriter:
         self,
         intent_id: str,
         intent_type: str,
+        category: str,
         text: str,
         confidence: float,
         actor_id: Optional[str],
@@ -85,6 +86,7 @@ class Neo4jWriter:
         Args:
             intent_id: Unique intent identifier
             intent_type: Type of intent (asking_question, etc.)
+            category: Intent category (information_seeking, building_creating, etc.)
             text: Intent text
             confidence: Confidence score (0.0-1.0)
             actor_id: User/IP/system that performed this intent
@@ -101,15 +103,19 @@ class Neo4jWriter:
             // Create Intent node
             MERGE (i:{self._label('Intent')} {{id: $intent_id}})
             SET i.type = $intent_type,
+                i.category = $category,
                 i.text = $text,
                 i.confidence = $confidence,
                 i.extracted_at = datetime($timestamp)
                 
-            // Create/link Actor if provided
+            // Create/link Actor and User if provided (User is the canonical identity node)
             WITH i
             {f'''
             MERGE (a:{self._label('Actor')} {{id: $actor_id}})
             MERGE (a)-[:{self._label('PERFORMED')}]->(i)
+            WITH i, a
+            MERGE (u:{self._label('User')} {{id: $actor_id}})
+            MERGE (u)-[:{self._label('PERFORMED')}]->(i)
             ''' if actor_id else ''}
             
             // Create Event reference nodes for lineage
@@ -129,6 +135,7 @@ class Neo4jWriter:
                 query,
                 intent_id=intent_id,
                 intent_type=intent_type,
+                category=category,
                 text=text,
                 confidence=confidence,
                 actor_id=actor_id,
