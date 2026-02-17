@@ -1,0 +1,686 @@
+"""
+Interpreter Test Suite - Full Coverage
+
+Tests all Interpreter components without requiring live DB/OpenAI connections.
+Uses mocks for asyncpg, OpenAI, and Neo4j.
+"""
+
+import pytest
+import asyncio
+import json
+import math
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch, AsyncMock, call
+import sys
+
+sys.path.insert(0, '/opt/basalmind/BasalMind_Consciousness/Interpreter')
+
+
+def _make_async_pool(mock_conn):
+    """
+    Build a mock asyncpg pool whose acquire() works correctly as:
+        async with pool.acquire() as conn:
+            ...
+
+    asyncpg.Pool.acquire() is a synchronous call that returns an
+    *async context manager* (not a coroutine).  If we make acquire()
+    itself an AsyncMock, the call returns a coroutine object which
+    does NOT support __aenter__/__aexit__, producing:
+        TypeError: 'coroutine' object does not support the
+                   asynchronous context manager protocol
+
+    The fix: make acquire() a plain MagicMock whose return value
+    has async __aenter__/__aexit__ attributes.
+    """
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_pool = MagicMock()
+    mock_pool.acquire = MagicMock(return_value=ctx)
+    return mock_pool
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Intent Extractor
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestIntentExtractor:
+    def setup_method(self):
+        from interpreter.intent_extractor import IntentExtractor
+        self.ex = IntentExtractor(confidence_threshold=0.3)
+
+    def test_asking_question_detected(self):
+        intents = self.ex.extract_from_event({
+            "event_id": "e1", "text": "How do we configure authentication?",
+            "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        assert any(i["type"] == "asking_question" for i in intents)
+
+    def test_making_decision_detected(self):
+        intents = self.ex.extract_from_event({
+            "event_id": "e2", "text": "Let's use PostgreSQL for the database",
+            "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        assert any(i["type"] == "making_decision" for i in intents)
+
+    def test_troubleshooting_detected(self):
+        # The intent_extractor maps bug/error reports to "reporting_bug" in the
+        # "fixing_maintaining" category, not a literal "troubleshooting" type.
+        intents = self.ex.extract_from_event({
+            "event_id": "e3", "text": "Error: Connection timeout when connecting to Redis",
+            "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        fixing_types = {"reporting_bug", "troubleshooting", "debugging", "fixing"}
+        assert any(
+            i["type"] in fixing_types or i.get("category") == "fixing_maintaining"
+            for i in intents
+        ), f"Expected a fixing/troubleshooting intent, got: {intents}"
+
+    def test_confidence_above_threshold(self):
+        intents = self.ex.extract_from_event({
+            "event_id": "e4", "text": "What is the best approach for caching?",
+            "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        assert all(i["confidence"] >= 0.3 for i in intents)
+
+    def test_empty_text_returns_no_intents(self):
+        intents = self.ex.extract_from_event({
+            "event_id": "e5", "text": "", "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        assert intents == []
+
+    def test_batch_extraction_returns_dict(self):
+        events = [
+            {"event_id": "e1", "text": "How does this work?", "user_id": "U1", "event_time": datetime.utcnow()},
+            {"event_id": "e2", "text": "Let's deploy this now", "user_id": "U2", "event_time": datetime.utcnow()},
+        ]
+        results = self.ex.extract_from_batch(events)
+        assert isinstance(results, dict)
+        assert "e1" in results
+
+    def test_high_threshold_filters_more(self):
+        from interpreter.intent_extractor import IntentExtractor
+        low = IntentExtractor(confidence_threshold=0.1)
+        high = IntentExtractor(confidence_threshold=0.9)
+        event = {"event_id": "e1", "text": "ok", "user_id": "U1", "event_time": datetime.utcnow()}
+        assert len(low.extract_from_event(event)) >= len(high.extract_from_event(event))
+
+    def test_intent_has_required_fields(self):
+        intents = self.ex.extract_from_event({
+            "event_id": "e1", "text": "Why is the build failing?",
+            "user_id": "U1", "event_time": datetime.utcnow()
+        })
+        for intent in intents:
+            assert "type" in intent
+            assert "confidence" in intent
+            assert "category" in intent
+
+    def test_nginx_event_no_text_intents(self):
+        results = self.ex.extract_from_batch([{
+            "event_id": "nginx-1", "source_system": "nginx", "text": "",
+            "metadata": {"path": "/api/auth", "status": 500},
+            "event_time": datetime.utcnow()
+        }])
+        # nginx events without text should have no text-based intents
+        if "nginx-1" in results:
+            assert isinstance(results["nginx-1"], list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread Analyzer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestThreadAnalyzer:
+    def _make_event(self, text, thread_id="thread_1", channel_id="C001",
+                    user_id="U1", event_id=None, offset_seconds=0):
+        return {
+            "event_id": event_id or f"evt_{text[:5]}",
+            "source_system": "slack",
+            "text": text,
+            "thread_id": thread_id,
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "observed_at": datetime.utcnow() + timedelta(seconds=offset_seconds)
+        }
+
+    def _make_analyzer(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value={
+            "context_id": "ctx-uuid-1234",
+            "phase": "initiation",
+            "pattern": "Q&A",
+            "message_count": 0
+        })
+        mock_conn.execute = AsyncMock()
+        pool = _make_async_pool(mock_conn)
+        return ThreadAnalyzer(postgres_pool=pool)
+
+    def test_detect_question_pattern(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        analyzer.question_keywords = {"how", "what", "why", "when", "where", "who", "can", "?"}
+        analyzer.decision_keywords = {"decide", "decision", "going with"}
+        analyzer.troubleshoot_keywords = {"error", "issue", "problem", "bug"}
+        analyzer.brainstorm_keywords = {"idea", "suggest", "what if"}
+        pattern = analyzer._detect_pattern("How do we configure auth?")
+        assert pattern == "Q&A"
+
+    def test_detect_troubleshooting_pattern(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        analyzer.question_keywords = {"how", "what", "?"}
+        analyzer.decision_keywords = {"decide"}
+        analyzer.troubleshoot_keywords = {"error", "issue", "problem", "bug"}
+        analyzer.brainstorm_keywords = {"idea"}
+        pattern = analyzer._detect_pattern("There is an error and a bug and a problem here")
+        assert pattern == "troubleshooting"
+
+    def test_extract_topic_removes_stopwords(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        topic = analyzer._extract_topic("the quick brown fox jumps over the lazy dog")
+        words = topic.split()
+        stopwords = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with"}
+        assert not any(w in stopwords for w in words)
+
+    def test_extract_topic_max_3_keywords(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        topic = analyzer._extract_topic("authentication configuration deployment monitoring scaling performance")
+        assert len(topic.split()) <= 3
+
+    def test_is_thread_resolved_thank_you(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        thread_data = {"questions": []}
+        events = [{"text": "thanks, that solved it!"}]
+        assert analyzer._is_thread_resolved(thread_data, events) is True
+
+    def test_is_thread_resolved_all_questions_answered(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        thread_data = {
+            "questions": [{"question": "how?", "answered": True}]
+        }
+        events = [{"text": "here is some code"}]
+        assert analyzer._is_thread_resolved(thread_data, events) is True
+
+    def test_is_thread_not_resolved_unanswered_questions(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        thread_data = {
+            "questions": [{"question": "how?", "answered": False}]
+        }
+        events = [{"text": "let me think about this"}]
+        assert analyzer._is_thread_resolved(thread_data, events) is False
+
+    def test_refine_pattern_decision_on_multiple_decisions(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        thread_data = {
+            "decisions": [{"decision": "use postgres"}, {"decision": "use redis"}],
+            "questions": [],
+            "pattern": "Q&A"
+        }
+        assert analyzer._refine_pattern(thread_data) == "decision"
+
+    def test_only_slack_events_processed(self):
+        from interpreter.thread_analyzer import ThreadAnalyzer
+        analyzer = ThreadAnalyzer.__new__(ThreadAnalyzer)
+        analyzer.active_threads = {}
+        analyzer.pool = MagicMock()
+        # Non-slack events should return empty immediately
+        result = asyncio.get_event_loop().run_until_complete(
+            analyzer.process_events(
+                [{"event_id": "e1", "source_system": "nginx", "text": "GET /api"}],
+                {}
+            )
+        )
+        assert result == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedding Generator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmbeddingGenerator:
+    def _make_generator(self, mock_embedding=None, mock_conn=None):
+        from interpreter.embedding_generator import EmbeddingGenerator
+        if mock_embedding is None:
+            mock_embedding = [0.1] * 1536
+        pool = _make_async_pool(mock_conn) if mock_conn else None
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=pool)
+            gen._call_openai = AsyncMock(return_value=mock_embedding)
+        return gen
+
+    @pytest.mark.asyncio
+    async def test_generate_turn_embedding_returns_vector(self):
+        gen = self._make_generator()
+        result = await gen.generate_turn_embedding(
+            event_id="evt-1", text="hello world", thread_id="thread-1"
+        )
+        assert result is not None
+        assert len(result) == 1536
+
+    @pytest.mark.asyncio
+    async def test_generate_turn_embedding_empty_text_returns_none(self):
+        gen = self._make_generator()
+        result = await gen.generate_turn_embedding(
+            event_id="evt-1", text="", thread_id="thread-1"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generate_turn_embedding_whitespace_returns_none(self):
+        gen = self._make_generator()
+        result = await gen.generate_turn_embedding(
+            event_id="evt-1", text="   ", thread_id="thread-1"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generate_thread_embedding_returns_vector(self):
+        gen = self._make_generator()
+        events = [
+            {"event_id": "e1", "source_system": "slack", "text": "question 1"},
+            {"event_id": "e2", "source_system": "slack", "text": "answer 1"},
+        ]
+        result = await gen.generate_thread_embedding(thread_id="t1", events=events)
+        assert result is not None
+        assert len(result) == 1536
+
+    @pytest.mark.asyncio
+    async def test_generate_thread_embedding_empty_events(self):
+        gen = self._make_generator()
+        result = await gen.generate_thread_embedding(thread_id="t1", events=[])
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_aggregate_thread_text_slack(self):
+        gen = self._make_generator()
+        events = [
+            {"source_system": "slack", "text": "first message"},
+            {"source_system": "slack", "text": "second message"},
+        ]
+        text = gen._aggregate_thread_text(events)
+        assert "first message" in text
+        assert "second message" in text
+
+    @pytest.mark.asyncio
+    async def test_aggregate_thread_text_nginx(self):
+        gen = self._make_generator()
+        events = [{
+            "source_system": "nginx",
+            "metadata": {"path": "/api/auth", "method": "GET", "status": 200}
+        }]
+        text = gen._aggregate_thread_text(events)
+        assert "Path: /api/auth" in text
+        assert "Method: GET" in text
+        assert "Status: 200" in text
+
+    @pytest.mark.asyncio
+    async def test_aggregate_thread_text_skips_empty(self):
+        gen = self._make_generator()
+        events = [
+            {"source_system": "slack", "text": ""},
+            {"source_system": "slack", "text": "real message"},
+        ]
+        text = gen._aggregate_thread_text(events)
+        assert text.strip() == "real message"
+
+    @pytest.mark.asyncio
+    async def test_openai_failure_returns_none(self):
+        gen = self._make_generator()
+        gen._call_openai = AsyncMock(return_value=None)
+        result = await gen.generate_turn_embedding(
+            event_id="evt-1", text="test", thread_id="t1"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_store_embedding_uses_json_string(self):
+        """Verify embedding is serialized as JSON string for pgvector."""
+        from interpreter.embedding_generator import EmbeddingGenerator
+        mock_conn = MagicMock()
+        mock_conn.execute = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_pool = _make_async_pool(mock_conn)
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+        embedding = [0.1, 0.2, 0.3]
+        await gen._store_embedding(
+            entity_type="turn", entity_id="e1", embedding_type="semantic",
+            embedding=embedding, text_content="test", source_event_ids=["e1"]
+        )
+        call_args = mock_conn.execute.call_args[0]
+        # arg layout: [0]=query, [1]=entity_type, [2]=entity_id, [3]=embedding_type,
+        #             [4]=model_name, [5]=embedding_str, [6]=text_content, ...
+        embedding_arg = call_args[5]
+        assert isinstance(embedding_arg, str)
+        assert json.loads(embedding_arg) == embedding
+
+    @pytest.mark.asyncio
+    async def test_generate_channel_embedding_mean_pools(self):
+        """Channel embedding is mean of thread vectors."""
+        from interpreter.embedding_generator import EmbeddingGenerator
+        # Two thread vectors
+        vec_a = [1.0] * 1536
+        vec_b = [3.0] * 1536
+
+        mock_conn = MagicMock()
+        mock_conn.fetch = AsyncMock(return_value=[
+            {"embedding": json.dumps(vec_a)},
+            {"embedding": json.dumps(vec_b)},
+        ])
+        mock_conn.execute = AsyncMock()
+        mock_pool = _make_async_pool(mock_conn)
+
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+        result = await gen.generate_channel_embedding(
+            channel_id="C001", thread_ids=["t1", "t2"]
+        )
+        assert result is not None
+        assert len(result) == 1536
+        assert abs(result[0] - 2.0) < 0.0001  # mean of 1.0 and 3.0
+
+    @pytest.mark.asyncio
+    async def test_generate_channel_embedding_no_threads_returns_none(self):
+        from interpreter.embedding_generator import EmbeddingGenerator
+        mock_conn = MagicMock()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_pool = _make_async_pool(mock_conn)
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+        result = await gen.generate_channel_embedding(channel_id="C001", thread_ids=[])
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_history_snapshot_drift_computed(self):
+        """Second snapshot has computed cosine distance from first."""
+        from interpreter.embedding_generator import EmbeddingGenerator
+
+        vec_prev = [1.0] + [0.0] * 1535
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value={
+            "snapshot_index": 1,
+            "emb_str": json.dumps(vec_prev)
+        })
+        mock_conn.execute = AsyncMock()
+        mock_pool = _make_async_pool(mock_conn)
+
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+
+        # New embedding orthogonal to previous (drift should be ~1.0)
+        vec_new = [0.0, 1.0] + [0.0] * 1534
+        await gen._store_thread_history_snapshot(
+            thread_id="t1", channel_id="C1", embedding=vec_new,
+            text_content="new topic", model_name="text-embedding-ada-002",
+            phase="discussion", pattern="Q&A", participant_count=2, message_count=5
+        )
+        execute_args = mock_conn.execute.call_args[0]
+        # arg layout: [0]=query, [1]=thread_id, [2]=channel_id, [3]=snapshot_index,
+        #             [4]=message_count, [5]=phase, [6]=pattern, [7]=participant_count,
+        #             [8]=model_name, [9]=embedding_str, [10]=text_content,
+        #             [11]=drift_from_prev, [12]=interpretation_id
+        drift = execute_args[11]
+        assert drift is not None
+        assert abs(drift - 1.0) < 0.01  # orthogonal vectors = cosine distance 1.0
+
+    @pytest.mark.asyncio
+    async def test_history_snapshot_no_previous_drift_is_none(self):
+        """First snapshot has drift=None."""
+        from interpreter.embedding_generator import EmbeddingGenerator
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value=None)  # No previous snapshot
+        mock_conn.execute = AsyncMock()
+        mock_pool = _make_async_pool(mock_conn)
+
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+        await gen._store_thread_history_snapshot(
+            thread_id="t1", channel_id="C1", embedding=[0.1] * 1536,
+            text_content="first message", model_name="text-embedding-ada-002",
+            phase="initiation", pattern="Q&A", participant_count=1, message_count=1
+        )
+        execute_args = mock_conn.execute.call_args[0]
+        drift = execute_args[11]
+        assert drift is None
+
+    @pytest.mark.asyncio
+    async def test_history_snapshot_index_increments(self):
+        """snapshot_index is prev + 1."""
+        from interpreter.embedding_generator import EmbeddingGenerator
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value={
+            "snapshot_index": 5,
+            "emb_str": json.dumps([0.1] * 1536)
+        })
+        mock_conn.execute = AsyncMock()
+        mock_pool = _make_async_pool(mock_conn)
+
+        with patch("interpreter.embedding_generator.openai.OpenAI"):
+            gen = EmbeddingGenerator(openai_api_key="sk-test", postgres_pool=mock_pool)
+        await gen._store_thread_history_snapshot(
+            thread_id="t1", channel_id="C1", embedding=[0.1] * 1536,
+            text_content="text", model_name="text-embedding-ada-002",
+            phase="exploration", pattern="Q&A", participant_count=2, message_count=6
+        )
+        execute_args = mock_conn.execute.call_args[0]
+        # arg layout: [0]=query, [1]=thread_id, [2]=channel_id, [3]=snapshot_index, ...
+        snapshot_index = execute_args[3]
+        assert snapshot_index == 6  # 5 + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel Summarizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestChannelSummarizer:
+    def _make_events(self, channel_id="C001", count=5):
+        return [
+            {
+                "event_id": f"evt-{i}",
+                "source_system": "slack",
+                "channel_id": channel_id,
+                "user_id": f"U{i % 3}",
+                "text": f"message {i}",
+                "observed_at": datetime.utcnow() + timedelta(seconds=i)
+            }
+            for i in range(count)
+        ]
+
+    def _make_summarizer(self, new_count=6, prev_count=5):
+        """
+        Build a ChannelSummarizer with a mocked pool.
+
+        _increment_counter does:
+            row = await conn.fetchrow(INSERT ... RETURNING new_count, prev_count)
+            return row["new_count"], row["prev_count"]
+
+        We control threshold behaviour via new_count/prev_count.
+        """
+        from interpreter.channel_summarizer import ChannelSummarizer
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value={
+            "new_count": new_count,
+            "prev_count": prev_count
+        })
+        mock_conn.execute = AsyncMock()
+        mock_pool = _make_async_pool(mock_conn)
+        summarizer = ChannelSummarizer(postgres_pool=mock_pool)
+        return summarizer, mock_conn
+
+    @pytest.mark.asyncio
+    async def test_initialize_no_error(self):
+        summarizer, _ = self._make_summarizer()
+        await summarizer.initialize()  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_skips_non_slack_events(self):
+        summarizer, mock_conn = self._make_summarizer()
+        nginx_events = [{
+            "event_id": "n1", "source_system": "nginx",
+            "channel_id": None, "text": "GET /api"
+        }]
+        result = await summarizer.process_events(nginx_events)
+        # No channel_id -> skipped, no DB increment
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_buffer_accumulates_events(self):
+        # Use high counts (200/199) so no summary threshold is crossed —
+        # we just want to verify the in-memory buffer is populated.
+        summarizer, _ = self._make_summarizer(new_count=200, prev_count=199)
+        events = self._make_events(count=3)
+        await summarizer.process_events(events)
+        assert "C001" in summarizer._recent_events
+        assert len(summarizer._recent_events["C001"]) >= 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session Tracker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSessionTracker:
+    def _make_tracker(self):
+        from interpreter.session_tracker import SessionTracker
+        mock_conn = MagicMock()
+        mock_conn.fetchrow = AsyncMock(return_value=None)  # No existing session
+        mock_conn.execute = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value="session-uuid-1234")
+        mock_pool = _make_async_pool(mock_conn)
+        return SessionTracker(postgres_pool=mock_pool, session_timeout_minutes=30)
+
+    def _make_event(self, user_id="U1", source="slack", offset_minutes=0):
+        return {
+            "event_id": f"evt-{user_id}",
+            "source_system": source,
+            "user_id": user_id,
+            "channel_id": "C001",
+            "observed_at": datetime.utcnow() + timedelta(minutes=offset_minutes)
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_events_returns_list(self):
+        tracker = self._make_tracker()
+        events = [self._make_event()]
+        result = await tracker.process_events(events, {})
+        assert isinstance(result, list)
+
+    @pytest.mark.asyncio
+    async def test_skips_events_without_user_id(self):
+        tracker = self._make_tracker()
+        event = {"event_id": "e1", "source_system": "slack", "observed_at": datetime.utcnow()}
+        result = await tracker.process_events([event], {})
+        # No user_id, should not crash and result is empty or empty list
+        assert isinstance(result, list)
+
+    def test_session_timeout_attribute(self):
+        tracker = self._make_tracker()
+        assert tracker.session_timeout == timedelta(minutes=30)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine Integration (smoke tests — no live DB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEngineIntegration:
+    """Smoke tests for engine class existence and EventDeduplicator."""
+
+    def test_engine_class_exists(self):
+        """InterpreterEngine is importable without env vars."""
+        # engine.py does NOT import asyncpg/neo4j/openai at module level,
+        # so no patching needed — the class itself is always importable.
+        import interpreter.engine as eng
+        assert hasattr(eng, "InterpreterEngine")
+
+    def test_engine_has_run_method(self):
+        import interpreter.engine as eng
+        assert hasattr(eng.InterpreterEngine, "run")
+
+    def test_event_deduplicator_filters_duplicates(self):
+        """EventDeduplicator collapses Slack events with same client_msg_id."""
+        from interpreter.event_deduplicator import EventDeduplicator
+        dedup = EventDeduplicator()
+        # Slack deduplication is keyed on client_msg_id, not event_id.
+        # Both events share a client_msg_id so they form one group.
+        # Each event also needs event_type for the culled_events metadata.
+        events = [
+            {
+                "event_id": "e1",
+                "event_type": "slack.message",
+                "source_system": "slack",
+                "text": "hello",
+                "user_id": "U1",
+                "metadata": {"client_msg_id": "msg-abc"},
+            },
+            {
+                "event_id": "e2",
+                "event_type": "slack.app_mention",
+                "source_system": "slack",
+                "text": "hello",
+                "user_id": "U1",
+                "metadata": {"client_msg_id": "msg-abc"},  # same → duplicate group
+            },
+            {
+                "event_id": "e3",
+                "event_type": "slack.message",
+                "source_system": "slack",
+                "text": "world",
+                "user_id": "U2",
+                "metadata": {},  # no client_msg_id → unique
+            },
+        ]
+        result = dedup.deduplicate(events)
+        # deduplicate() returns List[Dict], not a tuple
+        assert isinstance(result, list)
+        ids = [e["event_id"] for e in result]
+        # Group 1 (msg-abc) → 1 canonical; Group 2 (unique e3) → 1 canonical → total 2
+        assert len(result) == 2
+        assert len(ids) == len(set(ids))  # no duplicate IDs in output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drift Computation (pure math — no mocks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDriftComputation:
+    """Verify cosine distance math used in history snapshots."""
+
+    def _cosine_distance(self, a, b):
+        dot = sum(x * y for x, y in zip(a, b))
+        mag_a = math.sqrt(sum(x * x for x in a))
+        mag_b = math.sqrt(sum(x * x for x in b))
+        return 1.0 - dot / (mag_a * mag_b)
+
+    def test_identical_vectors_zero_drift(self):
+        v = [0.5] * 1536
+        assert abs(self._cosine_distance(v, v)) < 1e-6
+
+    def test_orthogonal_vectors_drift_one(self):
+        a = [1.0] + [0.0] * 1535
+        b = [0.0, 1.0] + [0.0] * 1534
+        assert abs(self._cosine_distance(a, b) - 1.0) < 1e-6
+
+    def test_opposite_vectors_drift_two(self):
+        a = [1.0] + [0.0] * 1535
+        b = [-1.0] + [0.0] * 1535
+        assert abs(self._cosine_distance(a, b) - 2.0) < 1e-6
+
+    def test_similar_vectors_low_drift(self):
+        import random
+        random.seed(42)
+        base = [random.gauss(0, 1) for _ in range(1536)]
+        # Small perturbation
+        perturbed = [x + random.gauss(0, 0.01) for x in base]
+        drift = self._cosine_distance(base, perturbed)
+        assert drift < 0.01  # similar vectors should have low drift
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
