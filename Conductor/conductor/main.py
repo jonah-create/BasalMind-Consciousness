@@ -1248,9 +1248,21 @@ def handle_decision(payload: Dict[str, Any]):
 
         elif clean_text:
             # Case 2: Commentary or question mid-Q&A — acknowledge and continue
-            logger.info(f"[DECISION] Mid-Q&A comment from user: {clean_text[:60]!r}")
-            # Use LLM to generate a brief, contextual response
-            _respond_to_mid_qa_comment(ctx, intent, clean_text, channel_id, thread_ts)
+            # Guard against double-fire: if no questions have been asked yet OR the text
+            # matches the original request, this is a duplicate event from Slack — ignore it.
+            initial_request = ctx.get('initial_request', '').strip().lower()
+            clean_lower = clean_text.strip().lower()
+            questions_asked = ctx.get('questions_asked', [])
+            is_initial_duplicate = (
+                not questions_asked  # no questions posted yet = definitely a double-fire
+                or clean_lower == initial_request
+                or clean_lower.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip() == initial_request
+            )
+            if is_initial_duplicate:
+                logger.debug(f"[DECISION] Suppressed double-fire duplicate for {channel_id}: {clean_text[:60]!r}")
+            else:
+                logger.info(f"[DECISION] Mid-Q&A comment from user: {clean_text[:60]!r}")
+                _respond_to_mid_qa_comment(ctx, intent, clean_text, channel_id, thread_ts)
         else:
             logger.debug(f"[DECISION] Already in CLARIFYING phase — ignoring empty message for {channel_id}")
 
