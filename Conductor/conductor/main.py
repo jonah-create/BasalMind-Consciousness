@@ -231,6 +231,72 @@ Respond ONLY with valid JSON in one of these two forms:
 {"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"]}"""
 
 
+_MID_QA_SYSTEM = """You are BasalMind, a technical project consultant mid-conversation.
+The user has added a comment or asked a question while you were clarifying their project scope.
+Respond briefly (1-3 sentences max) in a helpful, conversational tone.
+If they're correcting something (e.g. timeline is too long), acknowledge it specifically and confirm you've noted it.
+If they're asking a question, answer it directly.
+End by gently steering them back to the current question if appropriate.
+Do NOT use markdown headers. Keep it natural and concise."""
+
+
+def _respond_to_mid_qa_comment(ctx: Dict[str, Any], intent: str, comment: str,
+                                channel_id: str, thread_ts: Optional[str]):
+    """
+    Generate a brief, contextual reply to a mid-Q&A comment.
+    Also records any corrective information as a context note.
+    """
+    import openai as _openai
+    openai_key = os.getenv("OPENAI_API_KEY")
+
+    answers = ctx.get("answers", {})
+    answered_lines = "\n".join(f"- {k}: {v}" for k, v in answers.items()) or "None yet."
+    initial_request = ctx.get("initial_request", "")
+
+    user_prompt = (
+        f"Original request: {initial_request}\n"
+        f"Answers so far:\n{answered_lines}\n\n"
+        f"User's mid-conversation comment: \"{comment}\"\n\n"
+        "Respond naturally and briefly."
+    )
+
+    reply = None
+    if openai_key:
+        try:
+            client = _openai.OpenAI(api_key=openai_key)
+            messages = [
+                {"role": "system", "content": _MID_QA_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ]
+            with traced_generation(_lf, None, "conductor.mid_qa_response", "gpt-4o-mini", messages) as gen:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=150,
+                    temperature=0.5,
+                    timeout=8,
+                )
+                reply = response.choices[0].message.content.strip()
+                gen["output"] = reply
+                gen["usage"] = {
+                    "input": response.usage.prompt_tokens,
+                    "output": response.usage.completion_tokens,
+                }
+        except Exception as e:
+            logger.warning(f"[MID-QA] LLM reply failed: {e}")
+
+    if not reply:
+        reply = "Got it — I've noted that. Let's continue with the current question above."
+
+    # If comment sounds like a correction/preference, store it as a context note
+    notes = ctx.get("freeform_notes", [])
+    notes.append(comment)
+    ctx["freeform_notes"] = notes[-10:]  # keep last 10
+    save_project_context(channel_id, ctx)
+
+    _post_to_slack(channel_id, reply, thread_ts=thread_ts)
+
+
 def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[str, Any]]:
     """
     Ask the LLM what the single most valuable clarifying question is, given
@@ -251,6 +317,10 @@ def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[s
     # Build conversation context for the LLM
     answered_lines = "\n".join(f"- {k}: {v}" for k, v in answers.items()) if answers else "None yet."
     questions_asked = ctx.get("questions_asked", [])
+    freeform_notes = ctx.get("freeform_notes", [])
+    notes_section = ""
+    if freeform_notes:
+        notes_section = f"User freeform notes/corrections:\n" + "\n".join(f"- {n}" for n in freeform_notes) + "\n\n"
 
     user_prompt = (
         f"Project channel: #{channel_name}\n"
@@ -258,6 +328,7 @@ def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[s
         f"Original request: {initial_request}\n\n"
         f"Questions already asked: {questions_asked}\n"
         f"Answers received so far:\n{answered_lines}\n\n"
+        f"{notes_section}"
         "What is the single most important clarifying question to ask next? "
         "Or respond with {\"done\": true} if we have enough to plan."
     )
@@ -301,7 +372,7 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
     """
     Build Block Kit message for a single LLM-generated question.
     Always includes a 'Ready to plan →' button so the human can stop at any time.
-    Optionally shows a summary of answers given so far.
+    Shows a compact answered-so-far strip if any answers exist.
     """
     q_id = question.get("id", "q_misc")
     q_text = question.get("question", "")
@@ -309,12 +380,12 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
 
     blocks: List[Dict] = []
 
-    # Show answered context if any answers exist
+    # Compact "answered so far" context strip — just shows count/values briefly
     if answers_so_far:
-        summary = "  ".join(f"*{k}:* {v}" for k, v in answers_so_far.items())
+        summary = " · ".join(f"{v}" for v in answers_so_far.values())
         blocks.append({
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"✅ So far: {summary}"}],
+            "elements": [{"type": "mrkdwn", "text": f"_Answered so far: {summary}_"}],
         })
 
     blocks.append({
@@ -331,6 +402,15 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
             "value": json.dumps({"q_id": q_id, "answer": opt}),
             "action_id": f"clarify_{q_id}_{opt[:20].replace(' ', '_').replace('/', '_')}",
         })
+
+    # Always add "Other ✏️" — lets user type a freeform reply instead
+    answer_elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Other ✏️"},
+        "value": json.dumps({"q_id": q_id, "answer": "__other__"}),
+        "action_id": f"clarify_{q_id}__other__",
+    })
+
     if answer_elements:
         blocks.append({
             "type": "actions",
@@ -355,6 +435,22 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
     })
 
     return blocks
+
+
+def _build_answered_block(question_text: str, answer: str) -> List[Dict]:
+    """
+    Build the Block Kit replacement for a question card after the user answers.
+    Shows just this specific Q&A pair — clean, auditable record of each exchange.
+    """
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{question_text}*\n✅  {answer}",
+            },
+        }
+    ]
 
 
 def _build_approval_card(ctx: Dict[str, Any], plan: Dict[str, Any],
@@ -538,7 +634,9 @@ def _generate_plan(ctx: Dict[str, Any], intent: str) -> Dict[str, Any]:
     user_id = ctx.get("user_id", "unknown")
 
     # Build enriched context for entities
-    context_text = f"{text}\n\nProject: {channel_name}\nPreferences: {json.dumps(answers)}"
+    freeform_notes = ctx.get("freeform_notes", [])
+    notes_str = ("\nUser notes: " + "; ".join(freeform_notes)) if freeform_notes else ""
+    context_text = f"{text}\n\nProject: {channel_name}\nPreferences: {json.dumps(answers)}{notes_str}"
     correlation_id = str(uuid.uuid4())[:8]
 
     base_payload = {
@@ -854,8 +952,18 @@ def handle_decision(payload: Dict[str, Any]):
         metadata={"channel_id": channel_id, "channel_name": channel_name, "source": "conductor"},
     )
 
-    # Only engage on project-worthy intents from real Slack channels
-    if channel_id == "internal" or intent not in PROJECT_INTENTS:
+    # Only engage on project-worthy intents from real Slack channels.
+    # Exception: if a project is already in CLARIFYING phase, allow any @mention
+    # through — the user may be commenting or typing a freeform answer.
+    existing_ctx = get_project_context(channel_id)
+    existing_phase = existing_ctx.get("phase") if existing_ctx else None
+
+    if channel_id == "internal":
+        logger.debug(f"[DECISION] Skipping internal decision: {intent}")
+        end_trace(_lf, _lf_trace, {"skipped": True, "reason": "internal channel"})
+        return
+
+    if intent not in PROJECT_INTENTS and existing_phase != PHASE_CLARIFYING:
         logger.debug(f"[DECISION] Skipping non-project decision: {intent} / {channel_id}")
         end_trace(_lf, _lf_trace, {"skipped": True, "reason": "non-project intent"})
         return
@@ -868,8 +976,8 @@ def handle_decision(payload: Dict[str, Any]):
         end_trace(_lf, _lf_trace, {"action": "blocked", "action_type": action_type})
         return
 
-    # Get or create project context
-    ctx = get_project_context(channel_id)
+    # Get or create project context (reuse the one we already fetched for the phase check)
+    ctx = existing_ctx if existing_ctx is not None else None
     if ctx is None:
         ctx = create_project_context(channel_id, channel_name, user_id, text, thread_ts)
         logger.info(f"[DECISION] New project context for {channel_id}")
@@ -896,9 +1004,43 @@ def handle_decision(payload: Dict[str, Any]):
         _handle_clarification_phase(ctx, intent, text, channel_id, channel_name, thread_ts)
 
     elif phase == PHASE_CLARIFYING:
-        # Already mid-Q&A — a new decision from Basal means the user typed another
-        # message. Ignore it; the active question card is waiting for a button click.
-        logger.debug(f"[DECISION] Already in CLARIFYING phase — ignoring duplicate decision for {channel_id}")
+        # User typed a message while we're mid-Q&A. Two sub-cases:
+        # 1) They clicked "Other ✏️" and are now typing their freeform answer
+        # 2) They're adding commentary / asking a question
+
+        # Strip the @mention from the text for cleaner storage/display
+        clean_text = text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+
+        awaiting_q_id = ctx.get("awaiting_freeform_q_id")
+        if awaiting_q_id and clean_text:
+            # Case 1: They were prompted to type a freeform answer
+            logger.info(f"[DECISION] Freeform answer for {awaiting_q_id}: {clean_text[:60]!r}")
+            answers = ctx.get("answers", {})
+            answers[awaiting_q_id] = clean_text
+            ctx["answers"] = answers
+            ctx.pop("awaiting_freeform_q_id", None)
+
+            # Update the question card to show the answered Q+A
+            msg_ts = ctx.get("clarification_msg_ts")
+            if msg_ts:
+                question_text = ctx.get("question_texts", {}).get(awaiting_q_id, "")
+                _update_slack_message(
+                    channel_id, msg_ts,
+                    text=f"✅ {clean_text}",
+                    blocks=_build_answered_block(question_text, clean_text),
+                )
+            save_project_context(channel_id, ctx)
+
+            # Continue Q&A cascade
+            _handle_clarification_phase(ctx, intent, "", channel_id, channel_name, thread_ts)
+
+        elif clean_text:
+            # Case 2: Commentary or question mid-Q&A — acknowledge and continue
+            logger.info(f"[DECISION] Mid-Q&A comment from user: {clean_text[:60]!r}")
+            # Use LLM to generate a brief, contextual response
+            _respond_to_mid_qa_comment(ctx, intent, clean_text, channel_id, thread_ts)
+        else:
+            logger.debug(f"[DECISION] Already in CLARIFYING phase — ignoring empty message for {channel_id}")
 
     elif phase == PHASE_PLANNING:
         # Already planning — this is a duplicate trigger, ignore
@@ -962,6 +1104,12 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
         asked.append(q_id)
     ctx["questions_asked"] = asked
     ctx["phase"] = PHASE_CLARIFYING
+
+    # Store current question text keyed by q_id so we can display it on the answered card
+    question_texts = ctx.get("question_texts", {})
+    question_texts[q_id] = result.get("question", "")
+    ctx["question_texts"] = question_texts
+
     save_project_context(channel_id, ctx)
 
     answers_so_far = ctx.get("answers", {})
@@ -1068,26 +1216,44 @@ def handle_interaction(payload: Dict[str, Any]):
     if action_id.startswith("clarify_"):
         q_id   = action_value.get("q_id", "")
         answer = action_value.get("answer", "")
-        if q_id and answer:
-            answers = ctx.get("answers", {})
-            answers[q_id] = answer
-            ctx["answers"] = answers
-            save_project_context(channel_id, ctx)
-            logger.info(f"[INTERACTION] Clarification: {q_id}={answer}")
+        if not q_id:
+            return
 
-            # Replace the current question message with a "got it" confirmation
+        # "Other ✏️" — prompt user to type their own answer in Slack
+        if answer == "__other__":
+            question_text = ctx.get("question_texts", {}).get(q_id, "your question")
             msg_ts = ctx.get("clarification_msg_ts")
             if msg_ts:
-                all_answers = ctx.get("answers", {})
-                answered_lines = "\n".join(f"✅ *{k}:* {v}" for k, v in all_answers.items())
                 _update_slack_message(
                     channel_id, msg_ts,
-                    text=f"Got it — {answer}",
+                    text="Type your answer below",
                     blocks=[{
                         "type": "section",
                         "text": {"type": "mrkdwn",
-                                 "text": f"*Got it* ✅\n{answered_lines}"},
+                                 "text": f"*{question_text}*\n_Type your answer as a reply below \u2014 I'll pick it up automatically._"},
                     }]
+                )
+            # Store a sentinel so handle_decision knows the next @mention is a freeform answer
+            ctx["awaiting_freeform_q_id"] = q_id
+            save_project_context(channel_id, ctx)
+            return
+
+        if answer:
+            answers = ctx.get("answers", {})
+            answers[q_id] = answer
+            ctx["answers"] = answers
+            ctx.pop("awaiting_freeform_q_id", None)
+            save_project_context(channel_id, ctx)
+            logger.info(f"[INTERACTION] Clarification: {q_id}={answer}")
+
+            # Replace the answered question card with just this Q+A pair
+            msg_ts = ctx.get("clarification_msg_ts")
+            if msg_ts:
+                question_text = ctx.get("question_texts", {}).get(q_id, "")
+                _update_slack_message(
+                    channel_id, msg_ts,
+                    text=f"✅ {answer}",
+                    blocks=_build_answered_block(question_text, answer),
                 )
 
             # Ask next question (LLM decides whether to continue or plan)
