@@ -60,7 +60,8 @@ REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", 6390))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "_t9iV2e(p9voC34HpkvxirRoy%8cSYcf")
 
-SLACK_BOT_TOKEN  = os.getenv("SLACK_BOT_TOKEN")
+SLACK_BOT_TOKEN   = os.getenv("SLACK_BOT_TOKEN")
+SLACK_BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "U09BTHZV3E0")  # @basalmind
 MCP_URL          = os.getenv("MCP_SERVER_URL", "http://localhost:3100")
 ASSEMBLER_URL    = os.getenv("ASSEMBLER_URL", "http://localhost:5007")
 CARTOGRAPHER_URL = os.getenv("CARTOGRAPHER_URL", "http://localhost:5005")
@@ -131,6 +132,36 @@ def _get_slack() -> Optional[WebClient]:
         _health.slack_connected = True
         logger.info("✅ Slack client initialized")
     return _slack
+
+
+# Cache channel names to avoid repeated API calls
+_channel_name_cache: Dict[str, str] = {}
+
+# In-memory store for active Langfuse traces keyed by channel_id
+# Not stored in Redis — Langfuse objects are not JSON-serializable
+_active_traces: Dict[str, Any] = {}
+
+def _resolve_channel_name(channel_id: str) -> str:
+    """Look up real channel name from Slack API. Falls back to channel_id."""
+    if channel_id in _channel_name_cache:
+        return _channel_name_cache[channel_id]
+    slack = _get_slack()
+    if not slack:
+        return channel_id
+    try:
+        info = slack.conversations_info(channel=channel_id)
+        name = info["channel"].get("name", channel_id)
+        _channel_name_cache[channel_id] = name
+        return name
+    except Exception as e:
+        logger.debug(f"[SLACK] Could not resolve channel name for {channel_id}: {e}")
+        return channel_id
+
+
+def _is_bot_mentioned(text: str) -> bool:
+    """Return True if the message text contains an @mention of this bot."""
+    return f"<@{SLACK_BOT_USER_ID}>" in (text or "")
+
 
 # ── ProjectContext ─────────────────────────────────────────────────────────────
 
@@ -428,6 +459,23 @@ def _post_to_slack(channel_id: str, text: str, blocks: Optional[List] = None,
         logger.error(f"Slack post failed: {e.response['error']}")
         return None
 
+
+def _update_slack_message(channel_id: str, ts: str, text: str,
+                          blocks: Optional[List] = None) -> bool:
+    """Update an existing Slack message in place (chat.update)."""
+    slack = _get_slack()
+    if not slack or not ts:
+        return False
+    try:
+        kwargs: Dict[str, Any] = {"channel": channel_id, "ts": ts, "text": text}
+        if blocks:
+            kwargs["blocks"] = blocks
+        slack.chat_update(**kwargs)
+        return True
+    except SlackApiError as e:
+        logger.warning(f"Slack update failed: {e.response['error']}")
+        return False
+
 # ── Entity consultation ───────────────────────────────────────────────────────
 
 def _consult_entity(url: str, payload: Dict[str, Any], timeout: float = 25.0) -> Optional[Dict]:
@@ -516,7 +564,7 @@ def _execute_project(ctx: Dict[str, Any]):
     thread_ts  = ctx.get("thread_ts")
     user_id    = ctx.get("user_id", "unknown")
     channel_name = ctx.get("channel_name", channel_id)
-    lf_trace = ctx.pop("_lf_trace", None)  # retrieve trace started in handle_decision
+    lf_trace = _active_traces.pop(channel_id, None)  # retrieve trace started in handle_decision
 
     _post_to_slack(channel_id,
                    "⚙️ *Starting build...* I'll update this thread as each step completes.",
@@ -744,9 +792,17 @@ def handle_decision(payload: Dict[str, Any]):
     user_id     = normalized.get("user_id", "unknown")
     thread_ts   = normalized.get("thread_id") or normalized.get("source_timestamp")
     text        = normalized.get("text", "")
-    channel_name = normalized.get("channel_name", channel_id)
+    # Resolve real channel name — normalized may have raw ID
+    channel_name = normalized.get("channel_name") or _resolve_channel_name(channel_id)
 
     logger.info(f"[DECISION] channel={channel_id} intent={intent} action={action_type}")
+
+    # @mention gate: only engage if message explicitly @mentions the bot
+    # This prevents the bot from hijacking every human conversation in a channel
+    if channel_id != "internal" and intent in PROJECT_INTENTS:
+        if not _is_bot_mentioned(text):
+            logger.debug(f"[DECISION] No @mention in message — ignoring ({channel_id})")
+            return
 
     # Langfuse trace for this decision
     _lf_trace = start_trace(
@@ -778,8 +834,8 @@ def handle_decision(payload: Dict[str, Any]):
         ctx = create_project_context(channel_id, channel_name, user_id, text, thread_ts)
         logger.info(f"[DECISION] New project context for {channel_id}")
 
-    # Attach trace to context so _execute_project can close it
-    ctx["_lf_trace"] = _lf_trace
+    # Store trace in memory (not Redis — not JSON-serializable)
+    _active_traces[channel_id] = _lf_trace
 
     # Ensure thread_ts is captured
     if not ctx.get("thread_ts") and thread_ts:
@@ -816,7 +872,8 @@ def handle_decision(payload: Dict[str, Any]):
 
     # Close trace for non-execution paths (execution paths close it in _execute_project)
     if phase not in (PHASE_AWAITING_APPROVAL,):
-        end_trace(_lf, _lf_trace, {"phase": phase, "intent": intent, "routed": True})
+        trace_to_close = _active_traces.pop(channel_id, _lf_trace)
+        end_trace(_lf, trace_to_close, {"phase": phase, "intent": intent, "routed": True})
 
 
 def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
@@ -844,8 +901,11 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
     save_project_context(channel_id, ctx)
 
     blocks = _build_clarification_blocks(questions, channel_name)
-    _post_to_slack(channel_id, f"A few quick questions about `#{channel_name}`:",
-                   blocks=blocks, thread_ts=thread_ts)
+    msg_ts = _post_to_slack(channel_id, f"A few quick questions about `#{channel_name}`:",
+                            blocks=blocks, thread_ts=thread_ts)
+    if msg_ts:
+        ctx["clarification_msg_ts"] = msg_ts
+        save_project_context(channel_id, ctx)
 
 
 def _advance_to_planning(ctx: Dict[str, Any], intent: str, channel_id: str,
@@ -874,8 +934,12 @@ def _advance_to_planning(ctx: Dict[str, Any], intent: str, channel_id: str,
     save_project_context(channel_id, ctx)
 
     blocks = _build_approval_card(ctx, plan, story, risk)
-    _post_to_slack(channel_id, f"Here's the plan for `#{ctx.get('channel_name', channel_id)}`:",
-                   blocks=blocks, thread_ts=thread_ts)
+    approval_ts = _post_to_slack(channel_id,
+                                  f"Here's the plan for `#{ctx.get('channel_name', channel_id)}`:",
+                                  blocks=blocks, thread_ts=thread_ts)
+    if approval_ts:
+        ctx["approval_msg_ts"] = approval_ts
+        save_project_context(channel_id, ctx)
 
 # ── Interaction handler ───────────────────────────────────────────────────────
 
@@ -884,13 +948,21 @@ def handle_interaction(payload: Dict[str, Any]):
     Called when Jonah clicks a button in Slack.
     Handles: clarification answers, approve/modify/cancel on approval card.
     """
-    action_id    = payload.get("action_id", "")
-    action_value_raw = payload.get("action_value", "{}")
     channel_id   = payload.get("channel_id", "")
     user_id      = payload.get("user_id", "")
-    thread_ts    = payload.get("thread_ts")
 
-    logger.info(f"[INTERACTION] action={action_id} channel={channel_id} user={user_id}")
+    # Observer sends full Slack actions list — extract first action
+    actions = payload.get("actions", [])
+    first_action = actions[0] if actions else {}
+    action_id        = first_action.get("action_id", payload.get("action_id", ""))
+    action_value_raw = first_action.get("value", payload.get("action_value", "{}"))
+
+    # message.ts is the ts of the Block Kit message the button is on
+    message_obj = payload.get("message", {})
+    message_ts  = message_obj.get("ts") or payload.get("message_ts")
+    thread_ts   = payload.get("thread_ts") or message_ts
+
+    logger.info(f"[INTERACTION] action={action_id} channel={channel_id} user={user_id} msg_ts={message_ts}")
 
     try:
         action_value = json.loads(action_value_raw) if action_value_raw else {}
@@ -913,24 +985,58 @@ def handle_interaction(payload: Dict[str, Any]):
             save_project_context(channel_id, ctx)
             logger.info(f"[INTERACTION] Clarification: {q_id}={answer}")
 
+            # Update the original clarification message to show selected answers
+            msg_ts = ctx.get("clarification_msg_ts")
+            channel_name = ctx.get("channel_name", channel_id)
+            if msg_ts:
+                # Rebuild blocks showing all answers so far as checkmarks
+                all_answers = ctx.get("answers", {})
+                answered_lines = "\n".join(
+                    f"✅ *{k}:* {v}" for k, v in all_answers.items()
+                )
+                _update_slack_message(
+                    channel_id, msg_ts,
+                    text=f"Answers for #{channel_name}",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {"type": "mrkdwn",
+                                     "text": f"*#{channel_name} — your choices:*\n{answered_lines}"},
+                        }
+                    ]
+                )
+
             # Check if we can advance
             if _has_sufficient_context(ctx):
                 intent = ctx.get("pending_plan", {}).get("intent") or "request.feature"
-                _post_to_slack(channel_id, f"Got it — *{answer}*. Drafting your plan now...",
+                _post_to_slack(channel_id, "✏️ All set — drafting your build plan now...",
                                thread_ts=thread_ts)
                 _advance_to_planning(ctx, intent, channel_id, thread_ts)
-            else:
-                _post_to_slack(channel_id, f"Got it — *{answer}* ✓", thread_ts=thread_ts)
         return
 
     # Approval card actions
     action = action_value.get("action", "")
+
+    # Replace the approval card with a static confirmation so buttons disappear
+    approval_msg_ts = message_ts or ctx.get("approval_msg_ts")
+    channel_name = ctx.get("channel_name", channel_id)
 
     if action == "approve":
         _health.approvals_processed += 1
         ctx["phase"] = PHASE_EXECUTING
         save_project_context(channel_id, ctx)
         logger.info(f"[INTERACTION] APPROVED — executing for {channel_id}")
+        # Replace card with "building" confirmation (removes interactive buttons)
+        if approval_msg_ts:
+            _update_slack_message(
+                channel_id, approval_msg_ts,
+                text=f"✅ Plan approved — building #{channel_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn",
+                             "text": f"✅ *Plan approved* — building `#{channel_name}` now..."}
+                }]
+            )
         # Run execution in background thread to avoid blocking
         t = threading.Thread(target=_execute_project, args=(ctx,), daemon=True)
         t.start()
@@ -941,18 +1047,38 @@ def handle_interaction(payload: Dict[str, Any]):
         ctx["questions_asked"] = []
         ctx["pending_plan"] = None
         save_project_context(channel_id, ctx)
-        _post_to_slack(channel_id,
-                       "No problem — let's refine it. Tell me what you'd like to change:",
-                       thread_ts=thread_ts)
+        if approval_msg_ts:
+            _update_slack_message(
+                channel_id, approval_msg_ts,
+                text="Plan revision requested",
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "✏️ *Revision requested* — tell me what to change."}
+                }]
+            )
+        else:
+            _post_to_slack(channel_id,
+                           "No problem — let's refine it. Tell me what you'd like to change:",
+                           thread_ts=thread_ts)
 
     elif action == "cancel":
         _health.rejections_processed += 1
         ctx["phase"] = PHASE_INIT
         ctx["pending_plan"] = None
         save_project_context(channel_id, ctx)
-        _post_to_slack(channel_id,
-                       "Plan cancelled. Start fresh anytime by describing what you want to build.",
-                       thread_ts=thread_ts)
+        if approval_msg_ts:
+            _update_slack_message(
+                channel_id, approval_msg_ts,
+                text="Plan cancelled",
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "❌ *Plan cancelled.* Start fresh anytime by @mentioning me."}
+                }]
+            )
+        else:
+            _post_to_slack(channel_id,
+                           "Plan cancelled. @mention me anytime to start a new project.",
+                           thread_ts=thread_ts)
 
 # ── NATS subscriber loop ──────────────────────────────────────────────────────
 
