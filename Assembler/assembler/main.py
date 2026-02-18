@@ -24,6 +24,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Langfuse observability (non-fatal if unavailable)
+from assembler.langfuse_client import get_langfuse, traced_generation
+_lf = get_langfuse()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -181,18 +185,26 @@ def _llm_plan(intent: str, text: str, story_title: Optional[str], correlation_id
             context_parts.append(f"User story: {story_title}")
 
         prompt = "\n".join(context_parts) + "\n\nDesign a technical implementation plan."
+        messages = [
+            {"role": "system", "content": ASSEMBLER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": ASSEMBLER_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=600,
-            temperature=0.2,
-            timeout=20.0,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = None
+        with traced_generation(_lf, None, "assembler.llm_plan", "gpt-4o-mini", messages) as gen:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=600,
+                temperature=0.2,
+                timeout=20.0,
+            )
+            raw = response.choices[0].message.content.strip()
+            gen["output"] = raw[:500]
+            gen["usage"] = {
+                "input": response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+            }
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):

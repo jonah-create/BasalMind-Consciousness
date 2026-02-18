@@ -24,6 +24,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Langfuse observability (non-fatal if unavailable)
+from cartographer.langfuse_client import get_langfuse, traced_generation
+_lf = get_langfuse()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -145,17 +149,26 @@ Requester: {user_id}
 
 Translate this into a structured user story."""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": CARTOGRAPHER_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-            temperature=0.3,
-            timeout=8.0,
-        )
-        raw = response.choices[0].message.content.strip()
+        messages = [
+            {"role": "system", "content": CARTOGRAPHER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+
+        raw = None
+        with traced_generation(_lf, None, "cartographer.llm_story", "gpt-4o-mini", messages) as gen:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.3,
+                timeout=8.0,
+            )
+            raw = response.choices[0].message.content.strip()
+            gen["output"] = raw[:500]
+            gen["usage"] = {
+                "input": response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+            }
 
         # Strip markdown code fences if present
         if raw.startswith("```"):

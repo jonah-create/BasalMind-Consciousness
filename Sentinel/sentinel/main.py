@@ -28,6 +28,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Langfuse observability (non-fatal if unavailable)
+from sentinel.langfuse_client import get_langfuse, traced_generation
+_lf = get_langfuse()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -142,17 +146,26 @@ User request: {text[:600] if text else "(no text)"}
 
 Assess contextual risk factors not captured by the rule baseline."""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SENTINEL_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=250,
-            temperature=0.1,  # Low temperature: governance must be consistent
-            timeout=6.0,
-        )
-        raw = response.choices[0].message.content.strip()
+        messages = [
+            {"role": "system", "content": SENTINEL_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+
+        raw = None
+        with traced_generation(_lf, None, "sentinel.llm_risk_context", "gpt-4o-mini", messages) as gen:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=250,
+                temperature=0.1,  # Low temperature: governance must be consistent
+                timeout=6.0,
+            )
+            raw = response.choices[0].message.content.strip()
+            gen["output"] = raw[:500]
+            gen["usage"] = {
+                "input": response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+            }
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):

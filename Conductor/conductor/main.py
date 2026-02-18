@@ -38,6 +38,12 @@ from slack_sdk.errors import SlackApiError
 
 load_dotenv()
 
+# Langfuse observability (non-fatal if unavailable)
+from conductor.langfuse_client import (
+    get_langfuse, start_trace, end_trace, traced_generation, traced_span
+)
+_lf = get_langfuse()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -470,25 +476,31 @@ def _generate_plan(ctx: Dict[str, Any], intent: str) -> Dict[str, Any]:
 
 # ── MCP execution ─────────────────────────────────────────────────────────────
 
-def _call_mcp(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Call MCP server synchronously."""
-    try:
-        resp = httpx.post(
-            f"{MCP_URL}/mcp/call-tool",
-            json={"name": tool_name, "arguments": arguments},
-            timeout=60.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data.get("content", [])
-            text = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
-            try:
-                return json.loads(text)
-            except Exception:
-                return {"raw": text, "success": True}
-        return {"success": False, "error": f"HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+def _call_mcp(tool_name: str, arguments: Dict[str, Any],
+              lf_trace=None) -> Dict[str, Any]:
+    """Call MCP server synchronously. Optionally traces with Langfuse span."""
+    with traced_span(_lf, lf_trace, f"mcp.{tool_name}",
+                     {"tool": tool_name, "arguments": arguments}) as span:
+        try:
+            resp = httpx.post(
+                f"{MCP_URL}/mcp/call-tool",
+                json={"name": tool_name, "arguments": arguments},
+                timeout=60.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data.get("content", [])
+                text = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+                try:
+                    result = json.loads(text)
+                except Exception:
+                    result = {"raw": text, "success": True}
+            else:
+                result = {"success": False, "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            result = {"success": False, "error": str(e)}
+        span["output"] = result
+        return result
 
 # ── Execution flow ────────────────────────────────────────────────────────────
 
@@ -504,6 +516,7 @@ def _execute_project(ctx: Dict[str, Any]):
     thread_ts  = ctx.get("thread_ts")
     user_id    = ctx.get("user_id", "unknown")
     channel_name = ctx.get("channel_name", channel_id)
+    lf_trace = ctx.pop("_lf_trace", None)  # retrieve trace started in handle_decision
 
     _post_to_slack(channel_id,
                    "⚙️ *Starting build...* I'll update this thread as each step completes.",
@@ -517,7 +530,7 @@ def _execute_project(ctx: Dict[str, Any]):
         "user_id": user_id,
         "channel_id": channel_id,
         "initial_request": ctx.get("initial_request", ""),
-    })
+    }, lf_trace=lf_trace)
     project_id = init_result.get("project_id") or str(uuid.uuid4())[:8]
     ctx["project_id"] = project_id
 
@@ -534,7 +547,7 @@ def _execute_project(ctx: Dict[str, Any]):
     repo_result = _call_mcp("create_project_repository", {
         "project_id": project_id,
         "user_id": user_id,
-    })
+    }, lf_trace=lf_trace)
     repo_url = repo_result.get("repo_url", "")
     if repo_url:
         ctx["artifacts"]["repo_url"] = repo_url
@@ -551,7 +564,7 @@ def _execute_project(ctx: Dict[str, Any]):
     sandbox_result = _call_mcp("create_project_sandbox", {
         "project_id": project_id,
         "user_id": user_id,
-    })
+    }, lf_trace=lf_trace)
     container_name = sandbox_result.get("container_name", "")
     if container_name:
         ctx["artifacts"]["sandbox_container"] = container_name
@@ -568,7 +581,8 @@ def _execute_project(ctx: Dict[str, Any]):
     if container_name and project_id:
         _post_to_slack(channel_id, "🤖 *Generating code...* Writing the initial implementation into the sandbox.",
                        thread_ts=thread_ts)
-        game_url = _generate_and_deploy(ctx, project_id, container_name, channel_id, thread_ts)
+        game_url = _generate_and_deploy(ctx, project_id, container_name, channel_id, thread_ts,
+                                        lf_trace=lf_trace)
         if game_url:
             ctx["artifacts"]["game_url"] = game_url
     else:
@@ -594,9 +608,17 @@ def _execute_project(ctx: Dict[str, Any]):
     _health.executions_completed += 1
     logger.info(f"[EXECUTE] Project setup complete for {channel_id}")
 
+    # Close the Langfuse trace — project has reached REVIEWING
+    end_trace(_lf, lf_trace,
+              {"phase": PHASE_REVIEWING, "project_id": project_id,
+               "repo_url": repo_url, "game_url": game_url or ""},
+              score_name="execution_success",
+              score_value=1.0 if game_url else 0.5)
+
 
 def _generate_and_deploy(ctx: Dict[str, Any], project_id: str, container_name: str,
-                          channel_id: str, thread_ts: Optional[str]) -> Optional[str]:
+                          channel_id: str, thread_ts: Optional[str],
+                          lf_trace=None) -> Optional[str]:
     """
     Generate the initial implementation using OpenAI, write to sandbox, start HTTP server.
     Returns public URL on success, None on failure.
@@ -637,18 +659,28 @@ def _generate_and_deploy(ctx: Dict[str, Any], project_id: str, container_name: s
             "game over screen with restart button, and keyboard/touch controls."
         )
 
-        client = _openai.OpenAI(api_key=openai_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=4000,
-            timeout=60,
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        code = response.choices[0].message.content.strip()
+        client = _openai.OpenAI(api_key=openai_key)
+        code = None
+        with traced_generation(_lf, lf_trace, "conductor.code_generation",
+                               "gpt-4o-mini", messages) as gen:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=4000,
+                timeout=60,
+            )
+            code = response.choices[0].message.content.strip()
+            gen["output"] = code[:500]  # truncate for Langfuse
+            gen["usage"] = {
+                "input": response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+            }
+
         # Strip any accidental markdown code fences
         if code.startswith("```"):
             lines = code.split("\n")
@@ -661,7 +693,7 @@ def _generate_and_deploy(ctx: Dict[str, Any], project_id: str, container_name: s
             "project_id": project_id,
             "file_path": "index.html",
             "content": code,
-        })
+        }, lf_trace=lf_trace)
         if not write_result.get("success", False):
             logger.error(f"[GENERATE] write_file_to_sandbox failed: {write_result}")
             _post_to_slack(channel_id, f"⚠️ Code written but could not save to sandbox: {write_result.get('error', '')}", thread_ts=thread_ts)
@@ -672,11 +704,12 @@ def _generate_and_deploy(ctx: Dict[str, Any], project_id: str, container_name: s
             "project_id": project_id,
             "command": "pkill -f 'python3 -m http.server' 2>/dev/null || true; nohup python3 -m http.server 8080 > /tmp/server.log 2>&1 &",
             "timeout": 10,
-        })
+        }, lf_trace=lf_trace)
         logger.info(f"[GENERATE] HTTP server start: {run_result}")
 
         # Get sandbox URL
-        url_result = _call_mcp("get_sandbox_url", {"project_id": project_id})
+        url_result = _call_mcp("get_sandbox_url", {"project_id": project_id},
+                               lf_trace=lf_trace)
         game_url = url_result.get("url", "")
         if game_url:
             _post_to_slack(channel_id,
@@ -715,9 +748,20 @@ def handle_decision(payload: Dict[str, Any]):
 
     logger.info(f"[DECISION] channel={channel_id} intent={intent} action={action_type}")
 
+    # Langfuse trace for this decision
+    _lf_trace = start_trace(
+        _lf,
+        name="conductor.handle_decision",
+        session_id=channel_id,
+        user_id=user_id,
+        input_data={"intent": intent, "action_type": action_type, "text": text[:500]},
+        metadata={"channel_id": channel_id, "channel_name": channel_name, "source": "conductor"},
+    )
+
     # Only engage on project-worthy intents from real Slack channels
     if channel_id == "internal" or intent not in PROJECT_INTENTS:
         logger.debug(f"[DECISION] Skipping non-project decision: {intent} / {channel_id}")
+        end_trace(_lf, _lf_trace, {"skipped": True, "reason": "non-project intent"})
         return
 
     if action_type in ("block", "escalate"):
@@ -725,6 +769,7 @@ def handle_decision(payload: Dict[str, Any]):
         _post_to_slack(channel_id,
                        f"🛑 *Governance block:* {payload.get('decision', {}).get('rationale', 'Request blocked by policy')}",
                        thread_ts=thread_ts)
+        end_trace(_lf, _lf_trace, {"action": "blocked", "action_type": action_type})
         return
 
     # Get or create project context
@@ -732,6 +777,9 @@ def handle_decision(payload: Dict[str, Any]):
     if ctx is None:
         ctx = create_project_context(channel_id, channel_name, user_id, text, thread_ts)
         logger.info(f"[DECISION] New project context for {channel_id}")
+
+    # Attach trace to context so _execute_project can close it
+    ctx["_lf_trace"] = _lf_trace
 
     # Ensure thread_ts is captured
     if not ctx.get("thread_ts") and thread_ts:
@@ -765,6 +813,10 @@ def handle_decision(payload: Dict[str, Any]):
         ctx["pending_plan"] = None
         save_project_context(channel_id, ctx)
         _handle_clarification_phase(ctx, intent, text, channel_id, channel_name, thread_ts)
+
+    # Close trace for non-execution paths (execution paths close it in _execute_project)
+    if phase not in (PHASE_AWAITING_APPROVAL,):
+        end_trace(_lf, _lf_trace, {"phase": phase, "intent": intent, "routed": True})
 
 
 def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
