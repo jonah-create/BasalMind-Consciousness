@@ -1141,7 +1141,20 @@ def handle_decision(payload: Dict[str, Any]):
     if needs_save:
         save_project_context(channel_id, ctx)
 
-    phase = ctx.get("phase", PHASE_INIT)
+    # ── Freeform answer short-circuit ────────────────────────────────────────────
+    # If the bot is waiting for a typed freeform answer (awaiting_freeform_q_id),
+    # treat ANY incoming message as that answer — regardless of intent or @mention.
+    # This handles the case where the user replies in the thread without mentioning
+    # the bot, and Basal classifies the message as a new project request.
+    awaiting_q_id = ctx.get("awaiting_freeform_q_id") if ctx else None
+    clean_text_for_freeform = text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+    if awaiting_q_id and clean_text_for_freeform and ctx.get("phase") == PHASE_CLARIFYING:
+        logger.info(f"[DECISION] Freeform short-circuit: answer for {awaiting_q_id}: {clean_text_for_freeform[:60]!r}")
+        # Route directly to CLARIFYING handler — it will handle awaiting_freeform_q_id
+        phase = PHASE_CLARIFYING
+    else:
+        phase = ctx.get("phase", PHASE_INIT)
+
     logger.info(f"[DECISION] Project {channel_id} in phase {phase}")
 
     if phase == PHASE_INIT:
