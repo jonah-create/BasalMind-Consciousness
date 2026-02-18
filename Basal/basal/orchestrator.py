@@ -57,6 +57,7 @@ class Orchestrator:
         mcp_client=None,
         audit_store: Optional[AdvisoryAuditStore] = None,
         tracer: Optional[BasalTracer] = None,
+        nats_publisher=None,
     ):
         self._sessions = session_manager
         self._classifier = intent_classifier
@@ -64,6 +65,7 @@ class Orchestrator:
         self._reasoner = ReasoningEngine()
         self._audit = audit_store
         self._tracer = tracer
+        self._nats_publisher = nats_publisher  # DecisionPublisher for Conductor
         self._http_client: Optional[httpx.AsyncClient] = None
         self._events_processed = 0
         self._entity_availability: Dict[str, bool] = {
@@ -236,6 +238,33 @@ class Orchestrator:
                 decision=decision.to_dict(),
                 request_id=request_id,
             )
+
+        # 9. Publish decision to NATS so Conductor can act on it
+        # Subject: decisions.{channel_id} or decisions.internal for non-Slack events
+        try:
+            if self._nats_publisher:
+                normalized_data = event.get("normalized", {}) or {}
+                channel_id = (
+                    normalized_data.get("channel_id")
+                    if isinstance(normalized_data, dict) else None
+                ) or "internal"
+                decision_subject = f"decisions.{channel_id}"
+                decision_payload = {
+                    "request_id": request_id,
+                    "channel_id": channel_id,
+                    "event_type": event_type,
+                    "source": source,
+                    "intent": intent.intent,
+                    "intent_confidence": intent.confidence,
+                    "priority": intent.priority,
+                    "decision": decision.to_dict(),
+                    "event": event,
+                    "published_at": datetime.utcnow().isoformat(),
+                }
+                await self._nats_publisher.publish_decision(decision_subject, decision_payload)
+                log.info(f"Decision published → {decision_subject}", stage="PUBLISH")
+        except Exception as e:
+            log.warning(f"Decision publication failed (non-fatal): {e}", stage="PUBLISH")
 
         self._events_processed += 1
         log.info(f"Complete — total={self._events_processed}", stage="COMPLETE")

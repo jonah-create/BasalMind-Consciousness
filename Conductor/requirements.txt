@@ -1,0 +1,5 @@
+nats-py==2.9.0
+redis==5.0.1
+slack_sdk==3.27.1
+httpx==0.27.0
+python-dotenv==1.0.0

@@ -26,6 +26,7 @@ from basal.orchestrator import Orchestrator
 from basal.mcp_client import MCPClient
 from basal.advisory_audit import AdvisoryAuditStore
 from basal.langfuse_tracer import BasalTracer
+from basal.decision_publisher import DecisionPublisher
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -47,12 +48,13 @@ mcp_client: Optional[MCPClient] = None
 audit_store: Optional[AdvisoryAuditStore] = None
 tracer: Optional[BasalTracer] = None
 orchestrator: Optional[Orchestrator] = None
+decision_publisher: Optional[DecisionPublisher] = None
 
 
 @app.on_event("startup")
 async def startup_event():
     global session_manager, nats_subscriber, intent_classifier
-    global mcp_client, audit_store, tracer, orchestrator
+    global mcp_client, audit_store, tracer, orchestrator, decision_publisher
 
     logger.info("🧠 Starting Basal — orchestration layer")
 
@@ -77,17 +79,23 @@ async def startup_event():
     tracer = BasalTracer()
     logger.info("✅ Langfuse tracer initialized")
 
-    # 6. Orchestrator (wired with audit store + tracer)
+    # 6. Decision publisher (Conductor bridge)
+    decision_publisher = DecisionPublisher()
+    dp_connected = await decision_publisher.connect()
+    logger.info(f"{'✅' if dp_connected else '⚠️'} Decision publisher {'connected' if dp_connected else 'unavailable (non-fatal)'}")
+
+    # 7. Orchestrator (wired with audit store + tracer + decision publisher)
     orchestrator = Orchestrator(
         session_manager=session_manager,
         intent_classifier=intent_classifier,
         mcp_client=mcp_client,
         audit_store=audit_store,
         tracer=tracer,
+        nats_publisher=decision_publisher if dp_connected else None,
     )
     await orchestrator.initialize()
 
-    # 7. NATS subscriber
+    # 8. NATS subscriber
     nats_subscriber = NATSSubscriber()
     nats_connected = await nats_subscriber.connect()
     if nats_connected:
@@ -98,7 +106,8 @@ async def startup_event():
         f"Redis: {'✅' if session_manager.is_connected else '⚠️'} | "
         f"NATS: {'✅' if nats_subscriber.is_connected else '⚠️'} | "
         f"MCP: {'✅' if mcp_client.is_available else '⚠️'} | "
-        f"Langfuse: {'✅' if tracer and tracer.is_enabled else '⚠️'}"
+        f"Langfuse: {'✅' if tracer and tracer.is_enabled else '⚠️'} | "
+        f"Conductor bridge: {'✅' if dp_connected else '⚠️'}"
     )
 
 
@@ -107,6 +116,8 @@ async def shutdown_event():
     logger.info("🛑 Shutting down Basal")
     if nats_subscriber:
         await nats_subscriber.disconnect()
+    if decision_publisher:
+        await decision_publisher.disconnect()
     if orchestrator:
         await orchestrator.shutdown()
     if mcp_client:
