@@ -763,6 +763,117 @@ def _call_mcp(tool_name: str, arguments: Dict[str, Any],
 
 # ── Execution flow ────────────────────────────────────────────────────────────
 
+
+
+def _build_review_card(
+    channel_name: str,
+    project_id: str,
+    repo_url: Optional[str],
+    repo_name: Optional[str],
+    game_url: Optional[str],
+    sandbox_container: Optional[str],
+    story: Optional[Dict[str, Any]] = None,
+    plan: Optional[Dict[str, Any]] = None,
+) -> List[Dict]:
+    """
+    Consultant-quality Block Kit review card shown after execution completes.
+    Shows live URLs, delivery summary, and next-steps prompt.
+    """
+    import datetime as _dt
+
+    blocks: List[Dict] = []
+
+    # ── Header ─────────────────────────────────────────────────────────────
+    blocks.append({
+        "type": "header",
+        "text": {"type": "plain_text", "text": f"🎉 {channel_name} is live!", "emoji": True}
+    })
+
+    blocks.append({"type": "divider"})
+
+    # ── Delivery Status Section ─────────────────────────────────────────────
+    status_lines = []
+
+    if game_url:
+        status_lines.append(f"✅  *Play it now* → <{game_url}|Open game>")
+    else:
+        status_lines.append("⚠️  *Game URL* — sandbox not ready yet. Try `/sandbox-status` or reply `@BasalMind retry sandbox`.")
+
+    if repo_url:
+        label = repo_name or "GitHub repo"
+        status_lines.append(f"✅  *Repository* → <{repo_url}|{label}>")
+    else:
+        status_lines.append("⚠️  *GitHub repo* — creation failed. Reply `@BasalMind retry repo` to try again.")
+
+    if sandbox_container:
+        status_lines.append(f"✅  *Sandbox* — container `{sandbox_container}` running")
+    else:
+        status_lines.append("⚠️  *Sandbox* — Docker container unavailable")
+
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "\n".join(status_lines)}
+    })
+
+    blocks.append({"type": "divider"})
+
+    # ── Delivery Summary ────────────────────────────────────────────────────
+    summary_parts = []
+
+    if story:
+        pri = story.get("priority", "")
+        pts = story.get("story_points", "")
+        obj = story.get("business_objective", "")
+        if obj:
+            summary_parts.append(f"*Objective:* {obj}")
+        if pri or pts:
+            summary_parts.append(f"*Scope:* {pri} priority · {pts} story points")
+
+    if plan:
+        days = plan.get("estimated_days")
+        approach = plan.get("approach", "")
+        if approach:
+            summary_parts.append(f"*Approach:* {approach}")
+        if days:
+            summary_parts.append(f"*Estimated effort:* {days} day{'s' if days != 1 else ''}")
+        criteria = plan.get("success_criteria", [])
+        if criteria:
+            crit_lines = "\n".join(f"  ◦ {c}" for c in criteria[:3])
+            summary_parts.append(f"*Success criteria:*\n{crit_lines}")
+
+    if summary_parts:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(summary_parts)}
+        })
+        blocks.append({"type": "divider"})
+
+    # ── Next Steps / Iteration Prompt ───────────────────────────────────────
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                "*What would you like to change?*\n"
+                "Reply in this thread with `@BasalMind` and describe what to update — "
+                "I'll revise the code and redeploy automatically.\n\n"
+                "_Examples: 'make the bird faster', 'change the background color to dark blue', "
+                "'add a high score leaderboard'_"
+            )
+        }
+    })
+
+    # ── Footer ──────────────────────────────────────────────────────────────
+    ts = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {"type": "mrkdwn", "text": f"Project ID: `{project_id}` · Built by BasalMind · {ts}"}
+        ]
+    })
+
+    return blocks
+
 def _execute_project(ctx: Dict[str, Any]):
     """
     Execute the approved plan:
@@ -853,18 +964,23 @@ def _execute_project(ctx: Dict[str, Any]):
     ctx["phase"] = PHASE_REVIEWING
     save_project_context(channel_id, ctx)
 
-    # Final summary
-    repo_link  = f"<{ctx['artifacts'].get('repo_url', '#')}|GitHub repo>" if ctx["artifacts"].get("repo_url") else "_repo pending_"
-    sand_name  = ctx["artifacts"].get("sandbox_container", "_sandbox pending_")
-    url_line   = f"• Game: <{game_url}|Play it here!>" if game_url else ""
-
-    _post_to_slack(channel_id,
-        f"🎉 *Project `{channel_name}` is live!*\n\n"
-        f"• {repo_link}\n"
-        f"• Sandbox: `{sand_name}`\n"
-        f"{url_line}\n\n"
-        f"_Review the game above. Tell me what to change — I'll update it and redeploy._",
-        thread_ts=thread_ts)
+    # Final summary — Block Kit review card
+    review_blocks = _build_review_card(
+        channel_name=channel_name,
+        project_id=project_id,
+        repo_url=ctx["artifacts"].get("repo_url"),
+        repo_name=ctx["artifacts"].get("repo_name"),
+        game_url=game_url,
+        sandbox_container=ctx["artifacts"].get("sandbox_container"),
+        story=ctx.get("pending_plan", {}).get("story"),
+        plan=ctx.get("pending_plan", {}).get("plan"),
+    )
+    _post_to_slack(
+        channel_id,
+        f"🎉 {channel_name} is live! {'Play: ' + game_url if game_url else 'See thread for status.'}",
+        blocks=review_blocks,
+        thread_ts=thread_ts,
+    )
 
     _health.executions_completed += 1
     logger.info(f"[EXECUTE] Project setup complete for {channel_id}")
