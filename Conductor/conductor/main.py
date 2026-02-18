@@ -1080,11 +1080,19 @@ def handle_decision(payload: Dict[str, Any]):
     logger.info(f"[DECISION] channel={channel_id} intent={intent} action={action_type}")
 
     # @mention gate: only engage if message explicitly @mentions the bot
-    # This prevents the bot from hijacking every human conversation in a channel
+    # This prevents the bot from hijacking every human conversation in a channel.
+    # Exception: if the bot is awaiting a freeform typed answer, let ANY message
+    # through so the user doesn't have to @mention to reply to a prompt.
     if channel_id != "internal" and intent in PROJECT_INTENTS:
         if not _is_bot_mentioned(text):
-            logger.debug(f"[DECISION] No @mention in message — ignoring ({channel_id})")
-            return
+            # Peek at Redis ctx before dropping — if awaiting_freeform_q_id is set,
+            # pass through regardless of @mention
+            _peek_ctx = get_project_context(channel_id)
+            _awaiting = _peek_ctx.get("awaiting_freeform_q_id") if _peek_ctx else None
+            if not _awaiting:
+                logger.debug(f"[DECISION] No @mention in message — ignoring ({channel_id})")
+                return
+            logger.info(f"[DECISION] No @mention but awaiting freeform answer {_awaiting!r} — passing through")
 
     # Langfuse trace for this decision
     _lf_trace = start_trace(
