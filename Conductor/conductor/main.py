@@ -211,108 +211,148 @@ def create_project_context(channel_id: str, channel_name: str, user_id: str,
     save_project_context(channel_id, ctx)
     return ctx
 
-# ── Clarification questions ───────────────────────────────────────────────────
+# ── LLM-driven clarification ──────────────────────────────────────────────────
 
-# Questions batched by category — asked 3 at a time
-CLARIFICATION_QUESTIONS = {
-    "request.feature": [
-        {
-            "id": "platform",
-            "question": "What platform should this run on?",
-            "options": ["Web browser", "Mobile (iOS/Android)", "Desktop", "Both web and mobile"],
-        },
-        {
-            "id": "tech_stack",
-            "question": "Any tech stack preferences?",
-            "options": ["No preference — you choose", "HTML5 / JavaScript", "React", "Python backend needed"],
-        },
-        {
-            "id": "scope",
-            "question": "What's the scope for the first version?",
-            "options": ["Minimal playable prototype", "Full-featured MVP", "Just the core mechanic first"],
-        },
-        {
-            "id": "visual_style",
-            "question": "Visual style?",
-            "options": ["Pixel art / retro", "Clean and minimal", "Colorful and playful", "No preference"],
-        },
-        {
-            "id": "leaderboard",
-            "question": "Should this include a leaderboard or score tracking?",
-            "options": ["Yes, high score leaderboard", "Just show current score", "No scoring needed"],
-        },
-        {
-            "id": "deployment",
-            "question": "Where should this be deployed?",
-            "options": ["Docker sandbox (preview only)", "Public URL I can share", "GitHub repo only for now"],
-        },
-    ],
-    "request.bug_fix": [
-        {
-            "id": "reproduce",
-            "question": "Can you reproduce this bug consistently?",
-            "options": ["Yes, always happens", "Sometimes / intermittent", "Only happened once"],
-        },
-        {
-            "id": "severity",
-            "question": "How severe is this issue?",
-            "options": ["Critical — blocking all users", "High — affecting some users", "Low — cosmetic or edge case"],
-        },
-        {
-            "id": "environment",
-            "question": "Which environment is affected?",
-            "options": ["Production", "Staging only", "Local dev only", "All environments"],
-        },
-    ],
-}
+_CLARIFY_SYSTEM = """You are a senior technical consultant helping scope a software project.
+Your job: ask ONE focused clarifying question to gather the most important missing information.
 
-def _get_next_questions(ctx: Dict[str, Any], intent: str) -> List[Dict[str, Any]]:
-    """Return the next batch of up to 3 unanswered questions."""
-    all_questions = CLARIFICATION_QUESTIONS.get(intent, CLARIFICATION_QUESTIONS.get("request.feature", []))
-    asked = set(ctx.get("questions_asked", []))
-    answered = set(ctx.get("answers", {}).keys())
-    pending = [q for q in all_questions if q["id"] not in asked and q["id"] not in answered]
-    return pending[:3]
+Rules:
+- Ask only ONE question at a time.
+- Provide 3-4 short button options the user can click (plus they can always say "Ready to plan").
+- Read the conversation so far — don't repeat answered questions.
+- If you already have enough to build a solid plan (typically after 2-3 meaningful answers),
+  respond with {"done": true} to signal no more questions are needed.
+- Be a consultant, not a form — infer obvious answers from context (e.g. "HTML game" implies web browser).
+- Never ask about things that are clearly implied by the request.
+- Keep question text concise (under 12 words). Options under 6 words each.
 
-def _has_sufficient_context(ctx: Dict[str, Any]) -> bool:
-    """Enough answers to generate a plan (at least platform + scope answered)."""
+Respond ONLY with valid JSON in one of these two forms:
+{"done": true}
+{"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"]}"""
+
+
+def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[str, Any]]:
+    """
+    Ask the LLM what the single most valuable clarifying question is, given
+    everything asked and answered so far. Returns:
+      {"question": str, "id": str, "options": [str, ...]}  — ask this question
+      {"done": True}                                        — enough context, proceed
+      None                                                  — LLM unavailable, use fallback
+    """
+    import openai as _openai
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        return None
+
     answers = ctx.get("answers", {})
-    return len(answers) >= 2 or len(ctx.get("questions_asked", [])) >= 3
+    initial_request = ctx.get("initial_request", "")
+    channel_name = ctx.get("channel_name", "")
+
+    # Build conversation context for the LLM
+    answered_lines = "\n".join(f"- {k}: {v}" for k, v in answers.items()) if answers else "None yet."
+    questions_asked = ctx.get("questions_asked", [])
+
+    user_prompt = (
+        f"Project channel: #{channel_name}\n"
+        f"Intent: {intent}\n"
+        f"Original request: {initial_request}\n\n"
+        f"Questions already asked: {questions_asked}\n"
+        f"Answers received so far:\n{answered_lines}\n\n"
+        "What is the single most important clarifying question to ask next? "
+        "Or respond with {\"done\": true} if we have enough to plan."
+    )
+
+    try:
+        client = _openai.OpenAI(api_key=openai_key)
+        messages = [
+            {"role": "system", "content": _CLARIFY_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ]
+        with traced_generation(_lf, None, "conductor.clarify_question", "gpt-4o-mini", messages) as gen:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=200,
+                temperature=0.3,
+                timeout=10,
+            )
+            raw = response.choices[0].message.content.strip()
+            gen["output"] = raw
+            gen["usage"] = {
+                "input": response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+            }
+
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw.strip())
+        return parsed
+    except Exception as e:
+        logger.warning(f"[CLARIFY] LLM question generation failed: {e}")
+        return None
 
 # ── Block Kit builders ────────────────────────────────────────────────────────
 
-def _build_clarification_blocks(questions: List[Dict[str, Any]], channel_name: str) -> List[Dict]:
-    """Build Block Kit message with button-option clarification questions."""
-    blocks: List[Dict] = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Before I build a plan for #{channel_name}, I have a few quick questions:*"
-            }
-        },
-        {"type": "divider"},
-    ]
+def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
+                                answers_so_far: Dict[str, str]) -> List[Dict]:
+    """
+    Build Block Kit message for a single LLM-generated question.
+    Always includes a 'Ready to plan →' button so the human can stop at any time.
+    Optionally shows a summary of answers given so far.
+    """
+    q_id = question.get("id", "q_misc")
+    q_text = question.get("question", "")
+    options = question.get("options", [])
 
-    for q in questions:
+    blocks: List[Dict] = []
+
+    # Show answered context if any answers exist
+    if answers_so_far:
+        summary = "  ".join(f"*{k}:* {v}" for k, v in answers_so_far.items())
         blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{q['question']}*"},
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"✅ So far: {summary}"}],
         })
-        if q.get("options"):
-            elements = []
-            for opt in q["options"]:
-                elements.append({
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": opt},
-                    "value": json.dumps({"q_id": q["id"], "answer": opt}),
-                    "action_id": f"clarify_{q['id']}_{opt[:20].replace(' ', '_')}",
-                })
-            blocks.append({
-                "type": "actions",
-                "block_id": f"clarify_{q['id']}",
-                "elements": elements,
-            })
+
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f"*{q_text}*"},
+    })
+
+    # Answer option buttons
+    answer_elements = []
+    for opt in options:
+        answer_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": opt},
+            "value": json.dumps({"q_id": q_id, "answer": opt}),
+            "action_id": f"clarify_{q_id}_{opt[:20].replace(' ', '_').replace('/', '_')}",
+        })
+    if answer_elements:
+        blocks.append({
+            "type": "actions",
+            "block_id": f"clarify_{q_id}",
+            "elements": answer_elements,
+        })
+
+    # Always-present "Ready to plan" button — lets human skip remaining Q&A
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "actions",
+        "block_id": "ready_to_plan",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "📋 Ready to plan →"},
+                "style": "primary",
+                "value": json.dumps({"action": "ready_to_plan"}),
+                "action_id": "ready_to_plan",
+            }
+        ],
+    })
 
     return blocks
 
@@ -837,16 +877,28 @@ def handle_decision(payload: Dict[str, Any]):
     # Store trace in memory (not Redis — not JSON-serializable)
     _active_traces[channel_id] = _lf_trace
 
+    # Persist intent so clarification Q&A can reference it across interactions
+    needs_save = False
+    if not ctx.get("intent") and intent in PROJECT_INTENTS:
+        ctx["intent"] = intent
+        needs_save = True
     # Ensure thread_ts is captured
     if not ctx.get("thread_ts") and thread_ts:
         ctx["thread_ts"] = thread_ts
+        needs_save = True
+    if needs_save:
         save_project_context(channel_id, ctx)
 
     phase = ctx.get("phase", PHASE_INIT)
     logger.info(f"[DECISION] Project {channel_id} in phase {phase}")
 
-    if phase in (PHASE_INIT, PHASE_CLARIFYING):
+    if phase == PHASE_INIT:
         _handle_clarification_phase(ctx, intent, text, channel_id, channel_name, thread_ts)
+
+    elif phase == PHASE_CLARIFYING:
+        # Already mid-Q&A — a new decision from Basal means the user typed another
+        # message. Ignore it; the active question card is waiting for a button click.
+        logger.debug(f"[DECISION] Already in CLARIFYING phase — ignoring duplicate decision for {channel_id}")
 
     elif phase == PHASE_PLANNING:
         # Already planning — this is a duplicate trigger, ignore
@@ -879,29 +931,42 @@ def handle_decision(payload: Dict[str, Any]):
 def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
                                   channel_id: str, channel_name: str,
                                   thread_ts: Optional[str]):
-    """Post clarification questions or advance to planning if enough context."""
-    if _has_sufficient_context(ctx):
-        # We have enough — move to planning
+    """
+    Ask one LLM-generated clarifying question, or advance to planning if the
+    LLM decides enough context has been gathered.
+
+    The LLM sees the full conversation (request + all answers so far) and:
+    - Returns the single most valuable next question with options, OR
+    - Returns {"done": true} signalling it's read the room and has enough to plan
+    """
+    # Ask LLM what to ask next (or whether to proceed)
+    result = _llm_next_clarification(ctx, intent)
+
+    if result is None:
+        # LLM unavailable — proceed directly to planning
+        logger.warning("[CLARIFY] LLM unavailable — proceeding to planning without clarification")
         _advance_to_planning(ctx, intent, channel_id, thread_ts)
         return
 
-    questions = _get_next_questions(ctx, intent)
-    if not questions:
-        # All questions answered
+    if result.get("done"):
+        # LLM decided it has enough context
+        logger.info(f"[CLARIFY] LLM decided sufficient context — advancing to planning")
         _advance_to_planning(ctx, intent, channel_id, thread_ts)
         return
 
-    # Track which questions we're asking
+    # Track what we've asked so we don't repeat
+    q_id = result.get("id", f"q_{len(ctx.get('questions_asked', []))}")
+    result["id"] = q_id
     asked = ctx.get("questions_asked", [])
-    for q in questions:
-        if q["id"] not in asked:
-            asked.append(q["id"])
+    if q_id not in asked:
+        asked.append(q_id)
     ctx["questions_asked"] = asked
     ctx["phase"] = PHASE_CLARIFYING
     save_project_context(channel_id, ctx)
 
-    blocks = _build_clarification_blocks(questions, channel_name)
-    msg_ts = _post_to_slack(channel_id, f"A few quick questions about `#{channel_name}`:",
+    answers_so_far = ctx.get("answers", {})
+    blocks = _build_clarification_blocks(result, channel_name, answers_so_far)
+    msg_ts = _post_to_slack(channel_id, result.get("question", "A quick question:"),
                             blocks=blocks, thread_ts=thread_ts)
     if msg_ts:
         ctx["clarification_msg_ts"] = msg_ts
@@ -974,7 +1039,32 @@ def handle_interaction(payload: Dict[str, Any]):
         logger.warning(f"[INTERACTION] No project context for {channel_id}")
         return
 
-    # Clarification button click
+    channel_name = ctx.get("channel_name", channel_id)
+    # Intent hierarchy: stored in ctx > pending_plan > default
+    intent = (ctx.get("intent")
+              or (ctx.get("pending_plan", {}) or {}).get("intent")
+              or "request.feature")
+
+    # "Ready to plan" button — human has decided they've given enough information
+    if action_id == "ready_to_plan" or action_value.get("action") == "ready_to_plan":
+        logger.info(f"[INTERACTION] Ready to plan — human triggered planning for {channel_id}")
+        msg_ts = ctx.get("clarification_msg_ts")
+        if msg_ts:
+            all_answers = ctx.get("answers", {})
+            answered_lines = "\n".join(f"✅ *{k}:* {v}" for k, v in all_answers.items()) or "_No preferences specified_"
+            _update_slack_message(
+                channel_id, msg_ts,
+                text=f"Planning #{channel_name}",
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn",
+                             "text": f"*Planning `#{channel_name}` with your inputs:*\n{answered_lines}"},
+                }]
+            )
+        _advance_to_planning(ctx, intent, channel_id, thread_ts)
+        return
+
+    # Clarification button click — record answer and ask next question
     if action_id.startswith("clarify_"):
         q_id   = action_value.get("q_id", "")
         answer = action_value.get("answer", "")
@@ -985,33 +1075,23 @@ def handle_interaction(payload: Dict[str, Any]):
             save_project_context(channel_id, ctx)
             logger.info(f"[INTERACTION] Clarification: {q_id}={answer}")
 
-            # Update the original clarification message to show selected answers
+            # Replace the current question message with a "got it" confirmation
             msg_ts = ctx.get("clarification_msg_ts")
-            channel_name = ctx.get("channel_name", channel_id)
             if msg_ts:
-                # Rebuild blocks showing all answers so far as checkmarks
                 all_answers = ctx.get("answers", {})
-                answered_lines = "\n".join(
-                    f"✅ *{k}:* {v}" for k, v in all_answers.items()
-                )
+                answered_lines = "\n".join(f"✅ *{k}:* {v}" for k, v in all_answers.items())
                 _update_slack_message(
                     channel_id, msg_ts,
-                    text=f"Answers for #{channel_name}",
-                    blocks=[
-                        {
-                            "type": "section",
-                            "text": {"type": "mrkdwn",
-                                     "text": f"*#{channel_name} — your choices:*\n{answered_lines}"},
-                        }
-                    ]
+                    text=f"Got it — {answer}",
+                    blocks=[{
+                        "type": "section",
+                        "text": {"type": "mrkdwn",
+                                 "text": f"*Got it* ✅\n{answered_lines}"},
+                    }]
                 )
 
-            # Check if we can advance
-            if _has_sufficient_context(ctx):
-                intent = ctx.get("pending_plan", {}).get("intent") or "request.feature"
-                _post_to_slack(channel_id, "✏️ All set — drafting your build plan now...",
-                               thread_ts=thread_ts)
-                _advance_to_planning(ctx, intent, channel_id, thread_ts)
+            # Ask next question (LLM decides whether to continue or plan)
+            _handle_clarification_phase(ctx, intent, "", channel_id, channel_name, thread_ts)
         return
 
     # Approval card actions

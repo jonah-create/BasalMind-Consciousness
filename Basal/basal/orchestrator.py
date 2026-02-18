@@ -13,9 +13,15 @@ Every advisory exchange is fully auditable:
 
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+# Bot's own Slack user ID — messages from this user are ingested for
+# consciousness awareness but never trigger downstream decisions.
+# This prevents the bot from reacting to its own Slack posts.
+SLACK_BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "U09BTHZV3E0")
 
 import httpx
 
@@ -241,9 +247,21 @@ class Orchestrator:
 
         # 9. Publish decision to NATS so Conductor can act on it
         # Subject: decisions.{channel_id} or decisions.internal for non-Slack events
+        #
+        # Gate: if this message came from the bot itself, do NOT publish a decision.
+        # The event has already been ingested and traced above (consciousness awareness),
+        # but the bot must not react to its own posts — that creates a feedback loop.
+        normalized_data = event.get("normalized", {}) or {}
+        event_user_id = normalized_data.get("user_id", "") if isinstance(normalized_data, dict) else ""
+        if event_user_id and event_user_id == SLACK_BOT_USER_ID:
+            log.info(f"Bot-message gate: skipping decision publish for own message (user={event_user_id})",
+                     stage="PUBLISH")
+            self._events_processed += 1
+            log.info(f"Complete — total={self._events_processed}", stage="COMPLETE")
+            return record
+
         try:
             if self._nats_publisher:
-                normalized_data = event.get("normalized", {}) or {}
                 channel_id = (
                     normalized_data.get("channel_id")
                     if isinstance(normalized_data, dict) else None
