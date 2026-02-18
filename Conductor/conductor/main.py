@@ -218,17 +218,22 @@ Your job: ask ONE focused clarifying question to gather the most important missi
 
 Rules:
 - Ask only ONE question at a time.
-- Provide 3-4 short button options the user can click (plus they can always say "Ready to plan").
+- Provide 3-4 short button options.
 - Read the conversation so far — don't repeat answered questions.
-- If you already have enough to build a solid plan (typically after 2-3 meaningful answers),
-  respond with {"done": true} to signal no more questions are needed.
+- If you already have enough to build a solid plan (typically after 2-4 meaningful answers),
+  respond with {"done": true} to signal no more questions are needed. The system will
+  automatically add a final catch-all "anything else?" prompt before planning — you do NOT
+  need to add that yourself.
 - Be a consultant, not a form — infer obvious answers from context (e.g. "HTML game" implies web browser).
 - Never ask about things that are clearly implied by the request.
 - Keep question text concise (under 12 words). Options under 6 words each.
+- For questions where multiple selections make sense (e.g. "which features"), set "multi_select": true.
+  The user will be able to toggle multiple options and submit them together.
+- For single-choice questions (e.g. "which platform", "target age"), omit multi_select or set false.
 
 Respond ONLY with valid JSON in one of these two forms:
 {"done": true}
-{"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"]}"""
+{"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"], "multi_select": false}"""
 
 
 _MID_QA_SYSTEM = """You are BasalMind, a technical project consultant mid-conversation.
@@ -368,19 +373,26 @@ def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[s
 # ── Block Kit builders ────────────────────────────────────────────────────────
 
 def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
-                                answers_so_far: Dict[str, str]) -> List[Dict]:
+                                answers_so_far: Dict[str, str],
+                                selected_options: Optional[List[str]] = None) -> List[Dict]:
     """
     Build Block Kit message for a single LLM-generated question.
-    Always includes a 'Ready to plan →' button so the human can stop at any time.
+    Supports two modes:
+      - single-select: clicking an option immediately submits (default)
+      - multi_select=true: buttons toggle, a "Done ✓" button finalises selections
+    Always includes a 'Ready to plan →' button.
     Shows a compact answered-so-far strip if any answers exist.
+    selected_options: currently toggled options (for multi-select re-renders)
     """
     q_id = question.get("id", "q_misc")
     q_text = question.get("question", "")
-    options = question.get("options", [])
+    options = question.get("options", [])[:4]  # Slack actions block max 5 elements; reserve 1 for "Other ✏️"
+    multi = question.get("multi_select", False)
+    selected_options = selected_options or []
 
     blocks: List[Dict] = []
 
-    # Compact "answered so far" context strip — just shows count/values briefly
+    # Compact "answered so far" context strip
     if answers_so_far:
         summary = " · ".join(f"{v}" for v in answers_so_far.values())
         blocks.append({
@@ -388,22 +400,42 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
             "elements": [{"type": "mrkdwn", "text": f"_Answered so far: {summary}_"}],
         })
 
+    # Question heading — for multi-select, add a hint
+    hint = " _(select all that apply, then tap Done ✓)_" if multi else ""
     blocks.append({
         "type": "section",
-        "text": {"type": "mrkdwn", "text": f"*{q_text}*"},
+        "text": {"type": "mrkdwn", "text": f"*{q_text}*{hint}"},
     })
 
     # Answer option buttons
     answer_elements = []
     for opt in options:
-        answer_elements.append({
-            "type": "button",
-            "text": {"type": "plain_text", "text": opt},
-            "value": json.dumps({"q_id": q_id, "answer": opt}),
-            "action_id": f"clarify_{q_id}_{opt[:20].replace(' ', '_').replace('/', '_')}",
-        })
+        slug = opt[:20].replace(' ', '_').replace('/', '_')
+        if multi:
+            # In multi-select: toggling an option re-renders the card with a checkmark
+            is_selected = opt in selected_options
+            label = f"✅ {opt}" if is_selected else opt
+            answer_elements.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": label},
+                "value": json.dumps({
+                    "q_id": q_id,
+                    "toggle": opt,
+                    "current_selected": selected_options,
+                    "multi": True,
+                }),
+                "action_id": f"clarify_toggle_{q_id}_{slug}",
+            })
+        else:
+            # Single-select: clicking immediately submits the answer
+            answer_elements.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": opt},
+                "value": json.dumps({"q_id": q_id, "answer": opt}),
+                "action_id": f"clarify_{q_id}_{slug}",
+            })
 
-    # Always add "Other ✏️" — lets user type a freeform reply instead
+    # Always add "Other ✏️" — lets user type a freeform reply
     answer_elements.append({
         "type": "button",
         "text": {"type": "plain_text", "text": "Other ✏️"},
@@ -418,7 +450,27 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
             "elements": answer_elements,
         })
 
-    # Always-present "Ready to plan" button — lets human skip remaining Q&A
+    # Multi-select: show "Done ✓" submit button once at least one option is toggled
+    if multi and selected_options:
+        blocks.append({
+            "type": "actions",
+            "block_id": f"clarify_{q_id}_submit",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": f"Done ✓  ({len(selected_options)} selected)"},
+                    "style": "primary",
+                    "value": json.dumps({
+                        "q_id": q_id,
+                        "answer": ", ".join(selected_options),
+                        "multi_submit": True,
+                    }),
+                    "action_id": f"clarify_{q_id}_submit",
+                }
+            ],
+        })
+
+    # Always-present "Ready to plan" button
     blocks.append({"type": "divider"})
     blocks.append({
         "type": "actions",
@@ -457,8 +509,18 @@ def _build_approval_card(ctx: Dict[str, Any], plan: Dict[str, Any],
                           story: Dict[str, Any], risk: Dict[str, Any]) -> List[Dict]:
     """Build the Block Kit approval card shown to Jonah before execution."""
     channel_name = ctx.get("channel_name", "project")
+    repo_name = ctx.get("repo_name", _suggest_repo_name(channel_name, ctx.get("initial_request", "")))
     answers = ctx.get("answers", {})
-    answers_text = "\n".join(f"• *{k}*: {v}" for k, v in answers.items()) if answers else "_No preferences specified_"
+    # Show question text → answer pairs rather than raw q_id keys
+    question_texts = ctx.get("question_texts", {})
+    freeform_notes = ctx.get("freeform_notes", [])
+    answers_lines = []
+    for k, v in answers.items():
+        label = question_texts.get(k, k)
+        answers_lines.append(f"• *{label}:* {v}")
+    if freeform_notes:
+        answers_lines.append(f"• *Notes:* {'; '.join(freeform_notes)}")
+    answers_text = "\n".join(answers_lines) if answers_lines else "_No preferences specified_"
 
     phases = plan.get("phases", [])
     phases_text = "\n".join(
@@ -522,8 +584,19 @@ def _build_approval_card(ctx: Dict[str, Any], plan: Dict[str, Any],
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "_Approving will: create a GitHub repo, provision a Docker sandbox, and start building._"
+                "text": f"*GitHub repo:* `{repo_name}`"
+            },
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✏️ Edit name"},
+                "value": json.dumps({"action": "edit_repo_name", "channel_id": ctx["channel_id"]}),
+                "action_id": "edit_repo_name",
             }
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                          "text": "_Approving will create this repo, provision a Docker sandbox, and start building._"}],
         },
         {
             "type": "actions",
@@ -729,10 +802,12 @@ def _execute_project(ctx: Dict[str, Any]):
                        thread_ts=thread_ts)
 
     # Step 2 — GitHub repository
-    logger.info(f"[EXECUTE] Creating GitHub repo for project {project_id}")
+    repo_name = ctx.get("repo_name") or channel_name
+    logger.info(f"[EXECUTE] Creating GitHub repo '{repo_name}' for project {project_id}")
     repo_result = _call_mcp("create_project_repository", {
         "project_id": project_id,
         "user_id": user_id,
+        "repo_name": repo_name,
     }, lf_trace=lf_trace)
     repo_url = repo_result.get("repo_url", "")
     if repo_url:
@@ -963,7 +1038,7 @@ def handle_decision(payload: Dict[str, Any]):
         end_trace(_lf, _lf_trace, {"skipped": True, "reason": "internal channel"})
         return
 
-    if intent not in PROJECT_INTENTS and existing_phase != PHASE_CLARIFYING:
+    if intent not in PROJECT_INTENTS and existing_phase not in (PHASE_CLARIFYING, PHASE_AWAITING_APPROVAL):
         logger.debug(f"[DECISION] Skipping non-project decision: {intent} / {channel_id}")
         end_trace(_lf, _lf_trace, {"skipped": True, "reason": "non-project intent"})
         return
@@ -1013,7 +1088,28 @@ def handle_decision(payload: Dict[str, Any]):
 
         awaiting_q_id = ctx.get("awaiting_freeform_q_id")
         if awaiting_q_id and clean_text:
-            # Case 1: They were prompted to type a freeform answer
+            # Special case: user is editing the repo name after clicking "✏️ Edit name"
+            if awaiting_q_id == "q_repo_name":
+                # Parse "repo: name" or just treat the whole clean_text as the name
+                import re as _re
+                repo_match = _re.search(r'repo:\s*([a-zA-Z0-9_\-]+)', clean_text, _re.IGNORECASE)
+                new_repo = repo_match.group(1) if repo_match else _re.sub(r'[^a-z0-9-]', '', clean_text.lower().replace(' ', '-'))[:50]
+                new_repo = new_repo.strip('-') or ctx.get("repo_name", "basalmind-project")
+                ctx["repo_name"] = new_repo
+                ctx.pop("awaiting_freeform_q_id", None)
+                save_project_context(channel_id, ctx)
+                # Re-post the approval card with updated repo name
+                pending = ctx.get("pending_plan", {}) or {}
+                blocks = _build_approval_card(ctx, pending.get("plan", {}), pending.get("story", {}), pending.get("risk", {}))
+                approval_ts = _post_to_slack(channel_id,
+                                             f"Here's the updated plan for `#{channel_name}`:",
+                                             blocks=blocks, thread_ts=thread_ts)
+                if approval_ts:
+                    ctx["approval_msg_ts"] = approval_ts
+                    save_project_context(channel_id, ctx)
+                return
+
+            # Case 1: They were prompted to type a freeform clarification answer
             logger.info(f"[DECISION] Freeform answer for {awaiting_q_id}: {clean_text[:60]!r}")
             answers = ctx.get("answers", {})
             answers[awaiting_q_id] = clean_text
@@ -1047,10 +1143,32 @@ def handle_decision(payload: Dict[str, Any]):
         logger.debug(f"[DECISION] Already planning for {channel_id}")
 
     elif phase == PHASE_AWAITING_APPROVAL:
-        # Already has an approval card out — remind
-        _post_to_slack(channel_id,
-                       "⏳ Waiting for your approval on the plan above — use the buttons to proceed.",
-                       thread_ts=thread_ts)
+        clean_text = text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+        awaiting_q_id = ctx.get("awaiting_freeform_q_id")
+
+        if awaiting_q_id == "q_repo_name" and clean_text:
+            # User is typing a new repo name — same handling as in PHASE_CLARIFYING
+            import re as _re
+            repo_match = _re.search(r'repo:\s*([a-zA-Z0-9_\-]+)', clean_text, _re.IGNORECASE)
+            new_repo = repo_match.group(1) if repo_match else _re.sub(r'[^a-z0-9-]', '', clean_text.lower().replace(' ', '-'))[:50]
+            new_repo = new_repo.strip('-') or ctx.get("repo_name", "basalmind-project")
+            ctx["repo_name"] = new_repo
+            ctx.pop("awaiting_freeform_q_id", None)
+            save_project_context(channel_id, ctx)
+            # Re-post the approval card with updated repo name
+            pending = ctx.get("pending_plan", {}) or {}
+            blocks = _build_approval_card(ctx, pending.get("plan", {}), pending.get("story", {}), pending.get("risk", {}))
+            approval_ts = _post_to_slack(channel_id,
+                                         f"✅ Repo name updated to `{new_repo}`. Here's the updated plan:",
+                                         blocks=blocks, thread_ts=thread_ts)
+            if approval_ts:
+                ctx["approval_msg_ts"] = approval_ts
+                save_project_context(channel_id, ctx)
+        else:
+            # Already has an approval card out — remind
+            _post_to_slack(channel_id,
+                           "⏳ Waiting for your approval on the plan above — use the buttons to proceed.",
+                           thread_ts=thread_ts)
 
     elif phase in (PHASE_EXECUTING, PHASE_REVIEWING):
         # Project active — treat as an iteration request
@@ -1081,6 +1199,12 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
     - Returns the single most valuable next question with options, OR
     - Returns {"done": true} signalling it's read the room and has enough to plan
     """
+    # If the catch-all was already shown and answered, go straight to planning
+    if ctx.get("catch_all_asked") and "q_anything_else" in ctx.get("answers", {}):
+        logger.info(f"[CLARIFY] Catch-all answered — advancing to planning")
+        _advance_to_planning(ctx, intent, channel_id, thread_ts)
+        return
+
     # Ask LLM what to ask next (or whether to proceed)
     result = _llm_next_clarification(ctx, intent)
 
@@ -1091,8 +1215,36 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
         return
 
     if result.get("done"):
-        # LLM decided it has enough context
-        logger.info(f"[CLARIFY] LLM decided sufficient context — advancing to planning")
+        # LLM decided it has enough context.
+        # Before advancing to planning, ask one final open-ended catch-all question
+        # — unless we've already shown it (flag in ctx).
+        if not ctx.get("catch_all_asked"):
+            logger.info(f"[CLARIFY] LLM done — asking catch-all before planning")
+            ctx["catch_all_asked"] = True
+            q_id = "q_anything_else"
+            question_texts = ctx.get("question_texts", {})
+            question_texts[q_id] = "Any other requirements or constraints to note?"
+            ctx["question_texts"] = question_texts
+            asked = ctx.get("questions_asked", [])
+            if q_id not in asked:
+                asked.append(q_id)
+            ctx["questions_asked"] = asked
+            catch_all = {
+                "question": "Any other requirements or constraints to note?",
+                "id": q_id,
+                "options": ["Nope, looks good!", "Keep it simple", "Make it mobile-friendly"],
+                "multi_select": False,
+            }
+            ctx["current_question"] = catch_all
+            save_project_context(channel_id, ctx)
+            blocks = _build_clarification_blocks(catch_all, channel_name, ctx.get("answers", {}))
+            msg_ts = _post_to_slack(channel_id, catch_all["question"], blocks=blocks, thread_ts=thread_ts)
+            if msg_ts:
+                ctx["clarification_msg_ts"] = msg_ts
+                save_project_context(channel_id, ctx)
+            return
+        # Catch-all was already shown — now actually advance
+        logger.info(f"[CLARIFY] Catch-all answered — advancing to planning")
         _advance_to_planning(ctx, intent, channel_id, thread_ts)
         return
 
@@ -1110,6 +1262,9 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
     question_texts[q_id] = result.get("question", "")
     ctx["question_texts"] = question_texts
 
+    # Store the full current question dict for multi-select re-renders
+    ctx["current_question"] = result
+
     save_project_context(channel_id, ctx)
 
     answers_so_far = ctx.get("answers", {})
@@ -1121,10 +1276,36 @@ def _handle_clarification_phase(ctx: Dict[str, Any], intent: str, text: str,
         save_project_context(channel_id, ctx)
 
 
+def _suggest_repo_name(channel_name: str, initial_request: str) -> str:
+    """
+    Derive a clean GitHub repo name from the channel name or request.
+    GitHub rules: lowercase, alphanumeric + hyphens, no leading/trailing hyphens.
+    """
+    import re
+    # Prefer channel name if it looks descriptive (not just 'general', 'random', etc.)
+    base = channel_name or ""
+    if not base or base in ("general", "random", "dev", "engineering"):
+        # Fall back to first 5 words of request
+        words = re.sub(r'[^\w\s]', '', initial_request.lower()).split()
+        base = "-".join(words[:5])
+    # Sanitize: lowercase, replace spaces/underscores with hyphens, strip non-alphanum
+    base = base.lower().replace(" ", "-").replace("_", "-")
+    base = re.sub(r"[^a-z0-9-]", "", base)
+    base = re.sub(r"-+", "-", base).strip("-")
+    return base[:50] or "basalmind-project"
+
+
 def _advance_to_planning(ctx: Dict[str, Any], intent: str, channel_id: str,
                           thread_ts: Optional[str]):
     """Generate plan and post approval card."""
     ctx["phase"] = PHASE_PLANNING
+
+    # Suggest a repo name if not yet set
+    if not ctx.get("repo_name"):
+        ctx["repo_name"] = _suggest_repo_name(
+            ctx.get("channel_name", ""), ctx.get("initial_request", "")
+        )
+
     save_project_context(channel_id, ctx)
 
     _post_to_slack(channel_id, "✏️ *Drafting your build plan...* (this takes ~10 seconds)",
@@ -1212,6 +1393,33 @@ def handle_interaction(payload: Dict[str, Any]):
         _advance_to_planning(ctx, intent, channel_id, thread_ts)
         return
 
+    # Multi-select toggle — re-render the card with the new selection state
+    if action_id.startswith("clarify_toggle_"):
+        q_id = action_value.get("q_id", "")
+        toggled = action_value.get("toggle", "")
+        current = action_value.get("current_selected", [])
+        if toggled in current:
+            current.remove(toggled)
+        else:
+            current.append(toggled)
+        # Re-render the question card with updated selections
+        current_question = ctx.get("current_question", {})
+        if not current_question:
+            return
+        msg_ts = ctx.get("clarification_msg_ts")
+        if msg_ts:
+            answers_so_far = ctx.get("answers", {})
+            blocks = _build_clarification_blocks(current_question, channel_name, answers_so_far, current)
+            _update_slack_message(channel_id, msg_ts,
+                                  text=current_question.get("question", "Select options:"),
+                                  blocks=blocks)
+        return
+
+    # Multi-select submit (Done ✓ button) — treat exactly like a single clarify answer
+    if action_id.endswith("_submit") and action_value.get("multi_submit"):
+        # Fall through to the clarify_ handler below by renaming the action_id
+        action_id = "clarify_" + action_id  # triggers the startswith("clarify_") path
+
     # Clarification button click — record answer and ask next question
     if action_id.startswith("clarify_"):
         q_id   = action_value.get("q_id", "")
@@ -1258,6 +1466,21 @@ def handle_interaction(payload: Dict[str, Any]):
 
             # Ask next question (LLM decides whether to continue or plan)
             _handle_clarification_phase(ctx, intent, "", channel_id, channel_name, thread_ts)
+        return
+
+    # "Edit repo name" button on approval card
+    if action_id == "edit_repo_name" or action_value.get("action") == "edit_repo_name":
+        current_repo = ctx.get("repo_name", "")
+        # Prompt user to type new name in thread
+        _post_to_slack(channel_id,
+                       f"Current repo name is `{current_repo}`. "
+                       f"Reply with `@BasalMind repo: your-new-name` to change it.",
+                       thread_ts=thread_ts)
+        ctx["awaiting_freeform_q_id"] = "q_repo_name"
+        question_texts = ctx.get("question_texts", {})
+        question_texts["q_repo_name"] = "GitHub repo name"
+        ctx["question_texts"] = question_texts
+        save_project_context(channel_id, ctx)
         return
 
     # Approval card actions
