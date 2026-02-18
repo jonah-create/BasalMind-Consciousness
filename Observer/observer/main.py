@@ -608,79 +608,107 @@ async def observe_internal_event(request: Request):
         )
 
 
-@app.post("/observe/slack/interactions")
-async def observe_slack_interactions(request: Request):
+async def _handle_slack_interaction(request: Request) -> Response:
     """
-    Receive Slack interactive component payloads (button clicks, select menus).
+    Core handler for Slack interactive component payloads (button clicks).
 
     Slack sends interactions as application/x-www-form-urlencoded with a
     'payload' field containing a JSON string.
 
-    Normalizes the interaction and forwards to Conductor for project lifecycle
-    management (approve / modify / cancel / clarification answers).
+    Architecture: Observer normalizes the payload and publishes to the
+    BASALMIND_INTERACTIONS JetStream. Conductor consumes via durable
+    subscription. No direct HTTP coupling between Observer and Conductor.
+
+    Returns HTTP 200 immediately to satisfy Slack's 3-second ack requirement.
+    All downstream work happens asynchronously via NATS.
     """
     import urllib.parse
-    import httpx as _httpx
-
-    CONDUCTOR_URL = os.getenv("CONDUCTOR_URL", "http://localhost:5010")
 
     try:
         body = await request.body()
         body_str = body.decode("utf-8")
 
-        # Slack sends as form-encoded: payload=<json_string>
+        # Slack sends form-encoded: payload=<json_string>
         parsed = urllib.parse.parse_qs(body_str)
         payload_raw = parsed.get("payload", [None])[0]
 
         if not payload_raw:
-            # Might be sent as direct JSON (e.g. from tests)
+            # Accept direct JSON too (e.g. integration tests)
             try:
-                payload_raw = body_str
-                slack_payload = json.loads(payload_raw)
+                slack_payload = json.loads(body_str)
             except Exception:
-                return JSONResponse(status_code=400, content={"error": "Missing payload"})
+                logger.warning("[SLACK INTERACTION] Could not parse payload — returning 200 anyway")
+                return Response(content="", status_code=200)
         else:
             slack_payload = json.loads(payload_raw)
 
         interaction_type = slack_payload.get("type")
         logger.info(f"[SLACK INTERACTION] type={interaction_type}")
 
-        # Only handle block_actions (button clicks)
+        # Only handle block_actions (button clicks / select menus)
         if interaction_type != "block_actions":
-            return {"status": "ignored", "reason": f"unhandled type: {interaction_type}"}
+            logger.debug(f"[SLACK INTERACTION] Ignoring type={interaction_type}")
+            return Response(content="", status_code=200)
 
         # Normalize using existing adapter
         canonical = normalize_slack_button_click(slack_payload)
+        channel_id = (
+            (canonical.normalized.channel_id if canonical.normalized else None)
+            or slack_payload.get("channel", {}).get("id", "unknown")
+        )
 
-        # Build interaction payload for Conductor
+        # Build canonical interaction payload
         interaction = {
             "type": "slack_interaction",
             "action_type": "block_actions",
-            "channel_id": canonical.normalized.channel_id if canonical.normalized else slack_payload.get("channel", {}).get("id", "unknown"),
-            "user_id": canonical.normalized.user_id if canonical.normalized else slack_payload.get("user", {}).get("id"),
+            "channel_id": channel_id,
+            "user_id": (
+                (canonical.normalized.user_id if canonical.normalized else None)
+                or slack_payload.get("user", {}).get("id")
+            ),
             "actions": slack_payload.get("actions", []),
             "message": slack_payload.get("message", {}),
             "trigger_id": slack_payload.get("trigger_id"),
             "response_url": slack_payload.get("response_url"),
-            "raw_payload": slack_payload,
             "observed_at": datetime.utcnow().isoformat(),
         }
 
-        # Forward to Conductor (async, non-blocking)
-        try:
-            async with _httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(f"{CONDUCTOR_URL}/interaction", json=interaction)
-                logger.info(f"[SLACK INTERACTION] Forwarded to Conductor: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"[SLACK INTERACTION] Conductor forward failed (non-fatal): {e}")
+        # Publish to BASALMIND_INTERACTIONS JetStream
+        # Subject: interactions.{channel_id} — Conductor consumes via durable subscription
+        if nats_publisher and nats_publisher.is_connected:
+            try:
+                subject = f"interactions.{channel_id}"
+                payload_bytes = json.dumps(interaction, default=str).encode()
+                await nats_publisher.js.publish(subject, payload_bytes)
+                logger.info(f"[SLACK INTERACTION] Published to NATS {subject} ({len(payload_bytes)} bytes)")
+            except Exception as e:
+                logger.warning(f"[SLACK INTERACTION] NATS publish failed (non-fatal): {e}")
+        else:
+            logger.warning("[SLACK INTERACTION] NATS unavailable — interaction not published")
 
-        # Acknowledge to Slack immediately (must respond within 3s)
+        # Acknowledge to Slack immediately — downstream work is async via NATS
         return Response(content="", status_code=200)
 
     except Exception as e:
         logger.error(f"[SLACK INTERACTION] Error: {e}", exc_info=True)
-        # Still return 200 to Slack to avoid retries
+        # Always return 200 to Slack to prevent retries flooding the pipeline
         return Response(content="", status_code=200)
+
+
+@app.post("/observe/slack/interactive")
+async def observe_slack_interactive(request: Request):
+    """
+    Slack Interactivity Request URL endpoint.
+    Receives button clicks and Block Kit actions from Slack.
+    Publishes to BASALMIND_INTERACTIONS via NATS. Returns 200 immediately.
+    """
+    return await _handle_slack_interaction(request)
+
+
+@app.post("/observe/slack/interactions")
+async def observe_slack_interactions(request: Request):
+    """Alias for /observe/slack/interactive (backwards compatibility)."""
+    return await _handle_slack_interaction(request)
 
 
 def main():
