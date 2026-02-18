@@ -230,76 +230,17 @@ Rules:
 - For questions where multiple selections make sense (e.g. "which features"), set "multi_select": true.
   The user will be able to toggle multiple options and submit them together.
 - For single-choice questions (e.g. "which platform", "target age"), omit multi_select or set false.
+- For open-ended details that buttons cannot capture well (e.g. special design requirements,
+  describe your target user), use "freeform": true with exactly two options: ["Yes", "No"].
+  If the user clicks Yes they will be prompted to type freely; No skips the question.
+  Use freeform at most once per Q&A session and only when richly typed context would
+  meaningfully improve the plan.
 
-Respond ONLY with valid JSON in one of these two forms:
+Respond ONLY with valid JSON in one of these forms:
 {"done": true}
-{"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"], "multi_select": false}"""
+{"question": "...", "id": "q_<slug>", "options": ["Option A", "Option B", "Option C"], "multi_select": false}
+{"question": "Any specific design details or requirements to share?", "id": "q_freeform_details", "options": ["Yes", "No"], "freeform": true}"""
 
-
-_MID_QA_SYSTEM = """You are BasalMind, a technical project consultant mid-conversation.
-The user has added a comment or asked a question while you were clarifying their project scope.
-Respond briefly (1-3 sentences max) in a helpful, conversational tone.
-If they're correcting something (e.g. timeline is too long), acknowledge it specifically and confirm you've noted it.
-If they're asking a question, answer it directly.
-End by gently steering them back to the current question if appropriate.
-Do NOT use markdown headers. Keep it natural and concise."""
-
-
-def _respond_to_mid_qa_comment(ctx: Dict[str, Any], intent: str, comment: str,
-                                channel_id: str, thread_ts: Optional[str]):
-    """
-    Generate a brief, contextual reply to a mid-Q&A comment.
-    Also records any corrective information as a context note.
-    """
-    import openai as _openai
-    openai_key = os.getenv("OPENAI_API_KEY")
-
-    answers = ctx.get("answers", {})
-    answered_lines = "\n".join(f"- {k}: {v}" for k, v in answers.items()) or "None yet."
-    initial_request = ctx.get("initial_request", "")
-
-    user_prompt = (
-        f"Original request: {initial_request}\n"
-        f"Answers so far:\n{answered_lines}\n\n"
-        f"User's mid-conversation comment: \"{comment}\"\n\n"
-        "Respond naturally and briefly."
-    )
-
-    reply = None
-    if openai_key:
-        try:
-            client = _openai.OpenAI(api_key=openai_key)
-            messages = [
-                {"role": "system", "content": _MID_QA_SYSTEM},
-                {"role": "user", "content": user_prompt},
-            ]
-            with traced_generation(_lf, None, "conductor.mid_qa_response", "gpt-4o-mini", messages) as gen:
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    max_tokens=150,
-                    temperature=0.5,
-                    timeout=8,
-                )
-                reply = response.choices[0].message.content.strip()
-                gen["output"] = reply
-                gen["usage"] = {
-                    "input": response.usage.prompt_tokens,
-                    "output": response.usage.completion_tokens,
-                }
-        except Exception as e:
-            logger.warning(f"[MID-QA] LLM reply failed: {e}")
-
-    if not reply:
-        reply = "Got it — I've noted that. Let's continue with the current question above."
-
-    # If comment sounds like a correction/preference, store it as a context note
-    notes = ctx.get("freeform_notes", [])
-    notes.append(comment)
-    ctx["freeform_notes"] = notes[-10:]  # keep last 10
-    save_project_context(channel_id, ctx)
-
-    _post_to_slack(channel_id, reply, thread_ts=thread_ts)
 
 
 def _llm_next_clarification(ctx: Dict[str, Any], intent: str) -> Optional[Dict[str, Any]]:
@@ -408,10 +349,21 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
     })
 
     # Answer option buttons
+    freeform_mode = question.get("freeform", False)
     answer_elements = []
     for opt in options:
         slug = opt[:20].replace(' ', '_').replace('/', '_')
-        if multi:
+        if freeform_mode:
+            # Freeform yes/no: Yes prompts a typed reply, No records directly
+            is_yes = opt.lower() == "yes"
+            answer_elements.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": opt},
+                "style": "primary" if is_yes else "default",
+                "value": json.dumps({"q_id": q_id, "answer": opt, "freeform_yes": is_yes}),
+                "action_id": f"clarify_{q_id}_{slug}",
+            })
+        elif multi:
             # In multi-select: toggling an option re-renders the card with a checkmark
             is_selected = opt in selected_options
             label = f"✅ {opt}" if is_selected else opt
@@ -435,13 +387,14 @@ def _build_clarification_blocks(question: Dict[str, Any], channel_name: str,
                 "action_id": f"clarify_{q_id}_{slug}",
             })
 
-    # Always add "Other ✏️" — lets user type a freeform reply
-    answer_elements.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": "Other ✏️"},
-        "value": json.dumps({"q_id": q_id, "answer": "__other__"}),
-        "action_id": f"clarify_{q_id}__other__",
-    })
+    # "Other ✏️" only for standard (non-freeform) questions
+    if not freeform_mode:
+        answer_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Other ✏️"},
+            "value": json.dumps({"q_id": q_id, "answer": "__other__"}),
+            "action_id": f"clarify_{q_id}__other__",
+        })
 
     if answer_elements:
         blocks.append({
@@ -1231,6 +1184,12 @@ def handle_decision(payload: Dict[str, Any]):
             answers[awaiting_q_id] = clean_text
             ctx["answers"] = answers
             ctx.pop("awaiting_freeform_q_id", None)
+            # Persist in freeform_notes for planning context
+            notes = ctx.get("freeform_notes", [])
+            notes.append(clean_text)
+            ctx["freeform_notes"] = notes[-10:]
+            # Generate embedding for semantic retrieval
+            _store_freeform_embedding(ctx, clean_text, awaiting_q_id, channel_id)
 
             # Update the question card to show the answered Q+A
             msg_ts = ctx.get("clarification_msg_ts")
@@ -1247,22 +1206,9 @@ def handle_decision(payload: Dict[str, Any]):
             _handle_clarification_phase(ctx, intent, "", channel_id, channel_name, thread_ts)
 
         elif clean_text:
-            # Case 2: Commentary or question mid-Q&A — acknowledge and continue
-            # Guard against double-fire: if no questions have been asked yet OR the text
-            # matches the original request, this is a duplicate event from Slack — ignore it.
-            initial_request = ctx.get('initial_request', '').strip().lower()
-            clean_lower = clean_text.strip().lower()
-            questions_asked = ctx.get('questions_asked', [])
-            is_initial_duplicate = (
-                not questions_asked  # no questions posted yet = definitely a double-fire
-                or clean_lower == initial_request
-                or clean_lower.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip() == initial_request
-            )
-            if is_initial_duplicate:
-                logger.debug(f"[DECISION] Suppressed double-fire duplicate for {channel_id}: {clean_text[:60]!r}")
-            else:
-                logger.info(f"[DECISION] Mid-Q&A comment from user: {clean_text[:60]!r}")
-                _respond_to_mid_qa_comment(ctx, intent, clean_text, channel_id, thread_ts)
+            # Case 2: Non-freeform message while mid-Q&A — could be a Slack double-fire
+            # or an errant @mention. Silently ignore: the single Q&A flow handles everything.
+            logger.debug(f"[DECISION] Ignoring message in CLARIFYING (not a freeform answer): {clean_text[:60]!r}")
         else:
             logger.debug(f"[DECISION] Already in CLARIFYING phase — ignoring empty message for {channel_id}")
 
@@ -1465,6 +1411,33 @@ def _advance_to_planning(ctx: Dict[str, Any], intent: str, channel_id: str,
 
 # ── Interaction handler ───────────────────────────────────────────────────────
 
+
+def _store_freeform_embedding(ctx: Dict[str, Any], text: str, q_id: str, channel_id: str):
+    """
+    Generate a text-embedding-3-small embedding for a freeform answer and store
+    it in ctx["freeform_embeddings"] for semantic retrieval during planning.
+    Non-fatal if OpenAI is unavailable.
+    """
+    try:
+        import openai as _openai
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            return
+        client = _openai.OpenAI(api_key=openai_key)
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text[:8000],
+        )
+        vector = response.data[0].embedding
+        embeddings = ctx.get("freeform_embeddings", {})
+        embeddings[q_id] = {"text": text, "vector": vector}
+        ctx["freeform_embeddings"] = embeddings
+        save_project_context(channel_id, ctx)
+        logger.debug(f"[EMBED] Stored embedding for {q_id} ({len(vector)} dims)")
+    except Exception as e:
+        logger.warning(f"[EMBED] Embedding failed for {q_id}: {e}")
+
+
 def handle_interaction(payload: Dict[str, Any]):
     """
     Called when Jonah clicks a button in Slack.
@@ -1572,6 +1545,24 @@ def handle_interaction(payload: Dict[str, Any]):
             # Store a sentinel so handle_decision knows the next @mention is a freeform answer
             ctx["awaiting_freeform_q_id"] = q_id
             save_project_context(channel_id, ctx)
+            return
+
+        # Freeform question: user clicked "Yes" — set sentinel and prompt to type
+        if action_value.get("freeform_yes"):
+            ctx["awaiting_freeform_q_id"] = q_id
+            save_project_context(channel_id, ctx)
+            _post_to_slack(channel_id,
+                           "Type your answer below \u2014 I'll incorporate it into the plan.",
+                           thread_ts=thread_ts)
+            msg_ts = ctx.get("clarification_msg_ts")
+            question_text = ctx.get("question_texts", {}).get(q_id, "")
+            if msg_ts:
+                _update_slack_message(
+                    channel_id, msg_ts,
+                    text="Awaiting your typed answer...",
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                             "text": "*" + question_text + "*\n_Reply below \u2014 I'll pick it up automatically._"}}]
+                )
             return
 
         if answer:
