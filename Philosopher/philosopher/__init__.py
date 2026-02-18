@@ -1,0 +1,1 @@
+"""Philosopher - Pattern Insight Generator."""

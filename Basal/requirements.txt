@@ -1,0 +1,32 @@
+# Basal Service Requirements
+
+# Web framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# HTTP client for entity consultations
+httpx==0.26.0
+
+# NATS JetStream
+nats-py==2.6.0
+
+# Redis session management
+redis==5.0.1
+
+# Database drivers (read-only access to existing stores)
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# OpenAI (for embeddings, Stage 5+)
+openai==1.6.1
+
+# Langfuse observability (Stage 5+)
+langfuse==2.7.3
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.3
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
